@@ -69,6 +69,12 @@ class MarketContextBuilder:
             "mid_price": mid,
             "spread_bps": spread_bps,
             "top_book_imbalance": top_book_imbalance,
+            "depth_bid_quote_5": raw.get("depth_bid_quote_5"),
+            "depth_ask_quote_5": raw.get("depth_ask_quote_5"),
+            "depth_imbalance_5": raw.get("depth_imbalance_5"),
+            "depth_bid_quote_20": raw.get("depth_bid_quote_20"),
+            "depth_ask_quote_20": raw.get("depth_ask_quote_20"),
+            "depth_imbalance_20": raw.get("depth_imbalance_20"),
             "taker_delta_60s": float(flow_60.get("taker_delta_ratio") or 0.0),
             "taker_quote_60s": float(flow_60.get("taker_total_quote") or 0.0),
             "taker_delta_300s": float(flow_300.get("taker_delta_ratio") or 0.0),
@@ -116,7 +122,6 @@ class MarketContextBuilder:
                 )
             )
 
-        # Ordenacao por atividade e apenas um criterio de compactacao, nao sinal de trade.
         rows.sort(key=lambda x: x.get("taker_quote_60s") or 0.0, reverse=True)
         if max_symbols is not None:
             rows = rows[: max(0, int(max_symbols))]
