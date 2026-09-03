@@ -143,11 +143,17 @@ def _git_value(*args: str) -> Optional[str]:
         return None
 
 
-def _position_side(raw: Dict[str, Any]) -> str:
+def _row_matches_side(raw: Dict[str, Any], wanted_side: str) -> bool:
     explicit = str(raw.get("positionSide") or "").upper()
     if explicit in {"LONG", "SHORT"}:
-        return explicit
-    return "LONG" if float(raw.get("positionAmt") or 0) > 0 else "SHORT"
+        return explicit == wanted_side
+    try:
+        amount = float(raw.get("positionAmt") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount == 0:
+        return True
+    return (amount > 0 and wanted_side == "LONG") or (amount < 0 and wanted_side == "SHORT")
 
 
 def _query_order(client: Any, symbol: str, client_id: str) -> Dict[str, Any]:
@@ -169,7 +175,7 @@ def run(command_id: Optional[str] = None) -> Dict[str, Any]:
     branch = _git_value("rev-parse", "--abbrev-ref", "HEAD")
     head = _git_value("rev-parse", "HEAD")
     origin_main = _git_value("rev-parse", "origin/main")
-    dirty = _git_value("status", "--porcelain")
+    dirty = _git_value("status", "--porcelain", "--untracked-files=no")
     checks.append(_check("git_main", branch == "main", branch=branch))
     checks.append(_check("git_matches_origin_main", bool(head and origin_main and head == origin_main), head=head, origin_main=origin_main))
     checks.append(_check("git_tracked_tree_clean", dirty == "", dirty=bool(dirty)))
@@ -218,7 +224,15 @@ def run(command_id: Optional[str] = None) -> Dict[str, Any]:
         for value in managed.values()
         if isinstance(value, dict) and value.get("command_id") == selected
     ]
-    checks.append(_check("position_manager_recorded_command", bool(managed_matches), count=len(managed_matches)))
+    registered_in_journal = _event_ok(journal, selected, "POSITION_REGISTERED")
+    checks.append(
+        _check(
+            "position_manager_lifecycle_recorded",
+            bool(managed_matches) or registered_in_journal,
+            currently_managed=len(managed_matches),
+            registered_in_journal=registered_in_journal,
+        )
+    )
 
     if not BINANCE_API_KEY or not BINANCE_API_SECRET or not symbol:
         return _finalize(checks, selected, symbol)
@@ -254,22 +268,50 @@ def run(command_id: Optional[str] = None) -> Dict[str, Any]:
     matching_position_rows = [
         p for p in raw_positions
         if str(p.get("symbol") or "").upper() == symbol
-        and (side not in {"LONG", "SHORT"} or _position_side(p) == side)
+        and (side not in {"LONG", "SHORT"} or _row_matches_side(p, side))
     ]
     isolated = any(str(p.get("marginType") or "").lower() == "isolated" for p in matching_position_rows)
     checks.append(_check("binance_margin_isolated", isolated, matching_rows=len(matching_position_rows)))
+
+    live_position = any(abs(float(p.get("positionAmt") or 0)) > 0 for p in matching_position_rows)
+    close_evidence = (
+        _event_ok(journal, selected, "PROTECTION_FILLED")
+        or _event_ok(journal, selected, "EXCHANGE_RESULT", "CLOSE_POSITION")
+    )
+    checks.append(
+        _check(
+            "position_lifecycle_proven",
+            live_position or close_evidence,
+            live_position=live_position,
+            close_evidence=close_evidence,
+        )
+    )
+
+    try:
+        open_orders = conn.client.futures_get_open_orders(symbol=symbol)
+    except Exception:
+        open_orders = []
+    entry_prefix = entry_id.rsplit("_", 1)[0]
+    active_trailing = [
+        order for order in open_orders
+        if str(order.get("clientOrderId") or "").startswith(entry_prefix + "_trail")
+        and str(order.get("status") or "").upper() in {"NEW", "PARTIALLY_FILLED"}
+    ]
 
     stop_id = ExchangeAdapter.client_order_id(selected, "sl")
     stop_query = _query_order(conn.client, symbol, stop_id)
     stop_order = stop_query.get("order") or {}
     stop_status = str(stop_order.get("status") or "").upper()
+    stop_existed = stop_query.get("ok") is True and stop_status in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"}
+    stop_protects_live = stop_status in {"NEW", "PARTIALLY_FILLED"} or bool(active_trailing)
     checks.append(
         _check(
             "binance_stop_order_confirmed",
-            stop_query.get("ok") is True and stop_status in {"NEW", "FILLED", "CANCELED", "EXPIRED"},
+            stop_existed and (not live_position or stop_protects_live),
             client_order_id=stop_id,
             status=stop_order.get("status"),
             order_id=stop_order.get("orderId"),
+            active_trailing_count=len(active_trailing),
             error=stop_query.get("error"),
         )
     )
@@ -284,13 +326,23 @@ def run(command_id: Optional[str] = None) -> Dict[str, Any]:
         tp_results.append(
             {
                 "client_order_id": tp_id,
-                "ok": queried.get("ok") is True and status in {"NEW", "FILLED", "CANCELED", "EXPIRED"},
+                "exists": queried.get("ok") is True and status in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"},
+                "active": queried.get("ok") is True and status in {"NEW", "PARTIALLY_FILLED"},
                 "status": order.get("status"),
                 "order_id": order.get("orderId"),
                 "error": queried.get("error"),
             }
         )
-    checks.append(_check("binance_take_profit_orders_confirmed", bool(tp_results) and all(x["ok"] for x in tp_results), targets=tp_results))
+    tp_existence_ok = bool(tp_results) and all(x["exists"] for x in tp_results)
+    tp_live_ok = (not live_position) or any(x["active"] for x in tp_results)
+    checks.append(
+        _check(
+            "binance_take_profit_orders_confirmed",
+            tp_existence_ok and tp_live_ok,
+            targets=tp_results,
+            live_position=live_position,
+        )
+    )
 
     fatal_for_command = [
         row for row in journal
