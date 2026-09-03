@@ -1,0 +1,15 @@
+# Crypto Trader Bot - Mercado Lateral
+# Dependências Python
+
+# Binance API
+python-binance>=1.0.19
+
+# Análise de dados
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Indicadores técnicos
+ta>=0.11.0
+
+# Configurações
+python-dotenv>=1.0.0
