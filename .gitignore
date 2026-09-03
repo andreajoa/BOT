@@ -1,7 +1,16 @@
 .env
 .env.*
+!.env.example
+
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+venv/
+.venv/
+
 logs/
 .DS_Store
-!.env.example
