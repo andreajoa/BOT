@@ -65,6 +65,7 @@ class AdaptiveRuntime:
 
         self.symbols: List[str] = []
         self.candidate_symbols: List[str] = []
+        self.candidate_constraints: Dict[str, Dict[str, Any]] = {}
         self.scanner: Optional[ExecutableSymbolScanner] = None
         self.market_stream: Optional[FuturesMarketStream] = None
         self.derivatives: Optional[DerivativesSampler] = None
@@ -80,6 +81,30 @@ class AdaptiveRuntime:
         self.latest_execution: Optional[Dict[str, Any]] = None
         self.started_at = datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _constraint_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Safe public execution constraints supplied to the brain.
+
+        No credential or secret is ever included here.
+        """
+        return {
+            "symbol": row.get("symbol"),
+            "price": row.get("price"),
+            "min_qty": row.get("min_qty"),
+            "min_notional": row.get("min_notional"),
+            "required_notional": row.get("required_notional"),
+            "min_leverage_for_balance": row.get("min_leverage_for_balance"),
+            "usable_margin_usdt": row.get("usable_margin_usdt"),
+            "quote_volume_24h": row.get("quote_volume_24h"),
+        }
+
+    def _set_candidate_universe(self, universe: List[Dict[str, Any]]) -> None:
+        self.candidate_symbols = [str(row["symbol"]).upper() for row in universe]
+        self.candidate_constraints = {
+            str(row["symbol"]).upper(): self._constraint_row(row)
+            for row in universe
+        }
+
     async def initialize(self) -> None:
         connected = await asyncio.to_thread(self.connection.connect)
         if not connected:
@@ -91,7 +116,7 @@ class AdaptiveRuntime:
             max_margin_usage_pct=self.max_margin_usage_pct,
         )
         universe = await asyncio.to_thread(self.scanner.scan, None, self.max_symbols)
-        self.candidate_symbols = [row["symbol"] for row in universe]
+        self._set_candidate_universe(universe)
 
         raw_positions = await asyncio.to_thread(self.connection.client.futures_position_information)
         open_symbols = {
@@ -108,6 +133,7 @@ class AdaptiveRuntime:
             payload={
                 "symbols": self.symbols,
                 "candidate_symbols": self.candidate_symbols,
+                "candidate_constraints": list(self.candidate_constraints.values()),
                 "required_open_symbols": sorted(open_symbols),
                 "scanner": universe,
             },
@@ -219,14 +245,18 @@ class AdaptiveRuntime:
     async def refresh_universe_once(self) -> Dict[str, Any]:
         assert self.scanner and self.market_stream and self.derivatives and self.structure
         universe = await asyncio.to_thread(self.scanner.scan, None, self.max_symbols)
-        candidates = [row["symbol"] for row in universe]
+        candidates = [str(row["symbol"]).upper() for row in universe]
         required = self._required_monitor_symbols()
         new_symbols = sorted(set(candidates) | required)
         if not new_symbols:
             new_symbols = list(self.symbols)
 
         changed = new_symbols != sorted(self.symbols) or candidates != self.candidate_symbols
-        self.candidate_symbols = candidates
+        constraints_changed = {
+            str(row["symbol"]).upper(): self._constraint_row(row)
+            for row in universe
+        } != self.candidate_constraints
+        self._set_candidate_universe(universe)
         if changed:
             await asyncio.gather(
                 self.market_stream.replace_symbols(new_symbols),
@@ -239,16 +269,23 @@ class AdaptiveRuntime:
                 self.structure.sample_once(),
                 return_exceptions=True,
             )
+        if changed or constraints_changed:
             self.journal.append(
                 "RUNTIME_UNIVERSE_UPDATED",
                 payload={
                     "symbols": self.symbols,
                     "candidate_symbols": self.candidate_symbols,
+                    "candidate_constraints": list(self.candidate_constraints.values()),
                     "required_symbols": sorted(required),
                     "scanner": universe,
                 },
             )
-        return {"changed": changed, "symbols": self.symbols, "candidate_symbols": self.candidate_symbols}
+        return {
+            "changed": changed,
+            "constraints_changed": constraints_changed,
+            "symbols": self.symbols,
+            "candidate_symbols": self.candidate_symbols,
+        }
 
     async def universe_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -280,6 +317,11 @@ class AdaptiveRuntime:
         usdt = (account_snapshot.get("balances") or {}).get("USDT") or {}
         state["account"]["available_balance_usdt"] = usdt.get("available_balance")
         state["candidate_symbols"] = list(self.candidate_symbols)
+        state["candidate_execution_constraints"] = [
+            deepcopy(self.candidate_constraints[symbol])
+            for symbol in self.candidate_symbols
+            if symbol in self.candidate_constraints
+        ]
         state["monitor_only_symbols"] = sorted(set(self.symbols) - set(self.candidate_symbols))
         self.latest_state = state
         return state
@@ -414,6 +456,11 @@ class AdaptiveRuntime:
                     "bot_mode": BOT_MODE,
                     "symbols": self.symbols,
                     "candidate_symbols": self.candidate_symbols,
+                    "candidate_execution_constraints": [
+                        deepcopy(self.candidate_constraints[symbol])
+                        for symbol in self.candidate_symbols
+                        if symbol in self.candidate_constraints
+                    ],
                     "monitor_only_symbols": sorted(set(self.symbols) - set(self.candidate_symbols)),
                     "market_stream_connected": bool(self.market_stream and self.market_stream.connected),
                     "user_stream_connected": bool(self.user_stream and self.user_stream.connected),
@@ -444,7 +491,14 @@ class AdaptiveRuntime:
             asyncio.create_task(self.universe_loop(), name="universe-refresh"),
             asyncio.create_task(self.status_loop(), name="status"),
         ]
-        self.journal.append("RUNTIME_STARTED", payload={"symbols": self.symbols, "candidate_symbols": self.candidate_symbols})
+        self.journal.append(
+            "RUNTIME_STARTED",
+            payload={
+                "symbols": self.symbols,
+                "candidate_symbols": self.candidate_symbols,
+                "candidate_constraints": list(self.candidate_constraints.values()),
+            },
+        )
         try:
             await self.stop_event.wait()
         finally:
