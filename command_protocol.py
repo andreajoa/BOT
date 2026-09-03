@@ -100,6 +100,9 @@ class TradeCommand:
         self.trailing.validate()
         for target in self.take_profits:
             target.validate()
+        total_tp_pct = sum(float(target.close_pct) for target in self.take_profits)
+        if total_tp_pct > 100.000001:
+            raise ValueError("soma de take_profits.close_pct nao pode ultrapassar 100")
 
         if self.action == Action.WAIT:
             return
