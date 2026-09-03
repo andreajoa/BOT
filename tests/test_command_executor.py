@@ -43,10 +43,18 @@ class _Adapter:
     def __init__(self, sl_success=True):
         self.calls = []
         self.sl_success = sl_success
+        self.orders = {}
 
     @staticmethod
     def client_order_id(command_id, suffix):
         return f"brain_{command_id}_{suffix}"
+
+    def query_order(self, symbol, order_id=None, client_order_id=None):
+        self.calls.append(("query", symbol, client_order_id))
+        order = self.orders.get(client_order_id)
+        if order is None:
+            return {"success": False, "error": "-2013: Order does not exist"}
+        return {"success": True, "order": dict(order)}
 
     def set_leverage(self, symbol, leverage):
         self.calls.append(("leverage", symbol, leverage))
@@ -54,19 +62,17 @@ class _Adapter:
 
     def open_market(self, command_id, symbol, position_side, quantity):
         self.calls.append(("market", symbol, position_side, quantity))
-        return {
-            "success": True,
-            "quantity": quantity,
-            "order": {"status": "FILLED", "executedQty": str(quantity), "clientOrderId": f"brain_{command_id}_entry"},
-        }
+        client_id = f"brain_{command_id}_entry"
+        order = {"status": "FILLED", "executedQty": str(quantity), "clientOrderId": client_id}
+        self.orders[client_id] = dict(order)
+        return {"success": True, "quantity": quantity, "order": order}
 
     def open_limit(self, command_id, symbol, position_side, quantity, price):
         self.calls.append(("limit", symbol, position_side, quantity, price))
-        return {
-            "success": True,
-            "quantity": quantity,
-            "order": {"status": "NEW", "origQty": str(quantity), "clientOrderId": f"brain_{command_id}_entry"},
-        }
+        client_id = f"brain_{command_id}_entry"
+        order = {"status": "NEW", "origQty": str(quantity), "clientOrderId": client_id}
+        self.orders[client_id] = dict(order)
+        return {"success": True, "quantity": quantity, "order": order}
 
     def stop_close_all(self, command_id, symbol, position_side, stop_price, suffix="sl"):
         self.calls.append(("sl", symbol, stop_price))
@@ -118,11 +124,19 @@ def _approval(command_id="cmd-exec"):
 
 
 class CommandExecutorTests(unittest.TestCase):
-    def _executor(self, adapter=None):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        journal = ExecutionJournal(os.path.join(tmp.name, "journal.jsonl"))
-        return CommandExecutor(_Conn(), governor=_Governor(), adapter=adapter or _Adapter(), journal=journal)
+    def _executor(self, adapter=None, root=None):
+        if root is None:
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            root = tmp.name
+        journal = ExecutionJournal(os.path.join(root, "journal.jsonl"))
+        return CommandExecutor(
+            _Conn(),
+            governor=_Governor(),
+            adapter=adapter or _Adapter(),
+            journal=journal,
+            pending_path=os.path.join(root, "pending_entries.json"),
+        )
 
     def test_missing_approval_rejects_before_exchange(self):
         adapter = _Adapter()
@@ -138,7 +152,7 @@ class CommandExecutorTests(unittest.TestCase):
         result = executor.execute(_command(), _approval(), {})
         self.assertEqual(result["status"], "EXECUTED")
         kinds = [c[0] for c in adapter.calls]
-        self.assertEqual(kinds[:4], ["leverage", "market", "sl", "tp"])
+        self.assertEqual(kinds[:5], ["query", "leverage", "market", "sl", "tp"])
 
     def test_limit_waits_for_real_fill_before_protection(self):
         adapter = _Adapter()
@@ -164,6 +178,39 @@ class CommandExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "FAILED_SAFE")
         self.assertEqual(result["reason"], "STOP_LOSS_INSTALL_FAILED")
         self.assertIn("close", [c[0] for c in adapter.calls])
+
+    def test_limit_pending_survives_restart_and_recovers_fill(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        adapter = _Adapter()
+        executor = self._executor(adapter, tmp.name)
+        result = executor.execute(_command(EntryType.LIMIT), _approval(), {})
+        self.assertEqual(result["status"], "PENDING_FILL")
+
+        client_id = "brain_cmd-exec_entry"
+        adapter.orders[client_id]["status"] = "FILLED"
+        adapter.orders[client_id]["executedQty"] = "5"
+
+        restarted = self._executor(adapter, tmp.name)
+        self.assertIn(client_id, restarted.pending_entries)
+        outcomes = restarted.recover_pending_entries()
+        self.assertEqual(outcomes[client_id]["status"], "RECOVERED_EXECUTED")
+        self.assertNotIn(client_id, restarted.pending_entries)
+        self.assertIn("sl", [c[0] for c in adapter.calls])
+
+    def test_existing_entry_client_id_prevents_duplicate_order(self):
+        adapter = _Adapter()
+        client_id = "brain_cmd-exec_entry"
+        adapter.orders[client_id] = {
+            "status": "NEW",
+            "origQty": "5",
+            "clientOrderId": client_id,
+        }
+        executor = self._executor(adapter)
+        result = executor.execute(_command(EntryType.LIMIT), _approval(), {})
+        self.assertEqual(result["status"], "PENDING_FILL")
+        self.assertEqual(result["reason"], "ENTRY_RECOVERED_FROM_BINANCE")
+        self.assertNotIn("limit", [c[0] for c in adapter.calls])
 
 
 if __name__ == "__main__":
