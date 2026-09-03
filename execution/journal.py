@@ -12,7 +12,8 @@ import os
 import threading
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
 class ExecutionJournal:
@@ -25,10 +26,10 @@ class ExecutionJournal:
 
     @staticmethod
     def _serialize(value: Any) -> Any:
-        if is_dataclass(value):
-            return asdict(value)
-        if hasattr(value, "value") and value.__class__.__module__ == "enum":
+        if isinstance(value, Enum):
             return value.value
+        if is_dataclass(value):
+            return ExecutionJournal._serialize(asdict(value))
         if isinstance(value, dict):
             return {str(k): ExecutionJournal._serialize(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
