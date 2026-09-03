@@ -21,9 +21,7 @@ class DerivativesSampler:
     DATA = "https://fapi.binance.com/futures/data"
 
     def __init__(self, symbols: Iterable[str], period: str = "5m", interval_seconds: int = 60):
-        self.symbols = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
-        if not self.symbols:
-            raise ValueError("Informe ao menos um simbolo")
+        self.symbols = self._normalize_symbols(symbols)
         self.period = period
         self.interval_seconds = max(10, int(interval_seconds))
         self.state: Dict[str, Dict[str, Any]] = {}
@@ -31,6 +29,19 @@ class DerivativesSampler:
         self.last_update_ms = 0
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_symbols(symbols: Iterable[str]) -> List[str]:
+        result = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+        if not result:
+            raise ValueError("Informe ao menos um simbolo")
+        return result
+
+    async def replace_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = self._normalize_symbols(symbols)
+        async with self._lock:
+            self.symbols = normalized
+            self.state = {s: self.state[s] for s in normalized if s in self.state}
 
     @staticmethod
     def _get_json_sync(url: str) -> Any:
@@ -106,20 +117,23 @@ class DerivativesSampler:
         return item
 
     async def sample_once(self) -> Dict[str, Dict[str, Any]]:
-        results = await asyncio.gather(*(self.sample_symbol(s) for s in self.symbols), return_exceptions=True)
+        async with self._lock:
+            symbols = list(self.symbols)
+            previous_state = deepcopy(self.state)
+        results = await asyncio.gather(*(self.sample_symbol(s) for s in symbols), return_exceptions=True)
         update: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
-        async with self._lock:
-            previous_state = deepcopy(self.state)
 
-        for symbol, result in zip(self.symbols, results):
+        for symbol, result in zip(symbols, results):
             if isinstance(result, Exception):
                 errors.append(f"{symbol}: {result}")
             else:
                 update[symbol] = self._add_oi_change(result, previous_state.get(symbol))
 
         async with self._lock:
-            self.state.update(update)
+            active = set(self.symbols)
+            self.state.update({k: v for k, v in update.items() if k in active})
+            self.state = {s: self.state[s] for s in self.symbols if s in self.state}
             self.last_update_ms = int(time.time() * 1000)
             self.last_error = " | ".join(errors) if errors else None
             return deepcopy(self.state)
