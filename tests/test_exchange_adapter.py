@@ -49,6 +49,21 @@ class _Connection:
 
 
 class ExchangeAdapterTests(unittest.TestCase):
+    def test_real_length_command_id_keeps_order_roles_unique(self):
+        command_id = "0123456789abcdef0123456789abcdef"
+        entry = ExchangeAdapter.client_order_id(command_id, "entry")
+        stop = ExchangeAdapter.client_order_id(command_id, "sl")
+        tp1 = ExchangeAdapter.client_order_id(command_id, "tp1")
+        trail1 = ExchangeAdapter.client_order_id(command_id, "trail1")
+
+        self.assertLessEqual(len(entry), 36)
+        self.assertEqual(len({entry, stop, tp1, trail1}), 4)
+        self.assertTrue(entry.endswith("_entry"))
+        self.assertTrue(stop.endswith("_sl"))
+        self.assertTrue(tp1.endswith("_tp1"))
+        self.assertTrue(trail1.endswith("_trail1"))
+        self.assertEqual(entry, ExchangeAdapter.client_order_id(command_id, "entry"))
+
     def test_set_leverage_forces_isolated_margin_first(self):
         connection = _Connection()
         adapter = ExchangeAdapter(connection)
