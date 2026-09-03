@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Deterministic Binance execution adapter.
+"""Deterministic Binance USD-M execution adapter.
 
-No strategy lives here. It only translates already validated execution plans
-into exact Binance order requests and returns structured results.
+Normal entries (MARKET/LIMIT) use ``/fapi/v1/order``. Conditional protection
+(STOP/TP) uses the post-2025 USD-M Algo Order API (``/fapi/v1/algoOrder``).
+No strategy lives here.
 """
 
 from __future__ import annotations
@@ -21,17 +22,10 @@ class ExchangeAdapter:
 
     @staticmethod
     def client_order_id(command_id: str, suffix: str) -> str:
-        """Return a deterministic Binance-safe client id that preserves order role.
-
-        Binance caps ``newClientOrderId`` at 36 chars. Real command ids are UUID-like
-        32-char values, so simply truncating ``brain_<command>_<suffix>`` can remove
-        the suffix entirely and make entry/SL/TP collide. We instead hash the full
-        command id and reserve explicit space for the role suffix.
-        """
+        """Deterministic <=36-char id that always preserves the order role."""
         digest = hashlib.sha256(str(command_id).encode("utf-8")).hexdigest()[:18]
         role = re.sub(r"[^.A-Z:/a-z0-9_-]", "_", str(suffix))[:10] or "order"
-        value = f"brain_{digest}_{role}"
-        return value[:36]
+        return f"brain_{digest}_{role}"[:36]
 
     def _position_params(self, position_side: str) -> Dict[str, Any]:
         if self.connection.hedge_mode:
@@ -48,13 +42,22 @@ class ExchangeAdapter:
     def _close_side(position_side: str) -> str:
         return "SELL" if position_side == "LONG" else "BUY"
 
-    def _lookup_client_order(self, symbol: str, client_order_id: str) -> Dict[str, Any]:
-        """Pre-create idempotency check.
+    @staticmethod
+    def _api_error(exc: Exception) -> str:
+        code = getattr(exc, "code", None)
+        message = getattr(exc, "message", None) or str(exc)
+        return f"{code}: {message}" if code is not None else str(message)
 
-        -2013 is the normal "order does not exist" result and permits creation.
-        Any other lookup error fails closed because creating after an ambiguous
-        network/API failure could duplicate a protection order.
-        """
+    @staticmethod
+    def _not_found_exception(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        message = str(getattr(exc, "message", "") or str(exc)).lower()
+        return code in {-2011, -2013} or "does not exist" in message or "not found" in message
+
+    # ------------------------------------------------------------------
+    # Normal-order lookups: MARKET/LIMIT entries only
+    # ------------------------------------------------------------------
+    def _lookup_client_order(self, symbol: str, client_order_id: str) -> Dict[str, Any]:
         try:
             order = self.client.futures_get_order(
                 symbol=symbol.upper(),
@@ -62,34 +65,57 @@ class ExchangeAdapter:
             )
             return {"ok": True, "found": True, "order": order}
         except BinanceAPIException as exc:
-            if getattr(exc, "code", None) == -2013:
+            if self._not_found_exception(exc):
                 return {"ok": True, "found": False}
-            return {"ok": False, "found": False, "error": f"{exc.code}: {exc.message}"}
+            return {"ok": False, "found": False, "error": self._api_error(exc)}
         except Exception as exc:
             return {"ok": False, "found": False, "error": str(exc)}
 
-    def _existing_protection(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
-        lookup = self._lookup_client_order(symbol, client_order_id)
+    # ------------------------------------------------------------------
+    # Algo-order lookups: STOP/TP protections only
+    # ------------------------------------------------------------------
+    def _lookup_algo_order(self, symbol: str, client_algo_id: str) -> Dict[str, Any]:
+        try:
+            order = self.client.futures_get_algo_order(
+                symbol=symbol.upper(),
+                clientAlgoId=client_algo_id,
+            )
+            return {"ok": True, "found": True, "order": order}
+        except BinanceAPIException as exc:
+            if self._not_found_exception(exc):
+                return {"ok": True, "found": False}
+            return {"ok": False, "found": False, "error": self._api_error(exc)}
+        except Exception as exc:
+            return {"ok": False, "found": False, "error": str(exc)}
+
+    def _existing_protection(self, symbol: str, client_algo_id: str) -> Optional[Dict[str, Any]]:
+        lookup = self._lookup_algo_order(symbol, client_algo_id)
         if not lookup.get("ok"):
             return {
                 "success": False,
                 "error": "PROTECTION_IDEMPOTENCY_CHECK_FAILED",
                 "details": lookup,
+                "is_algo": True,
             }
         if not lookup.get("found"):
             return None
-        order = lookup.get("order") or {}
-        status = str(order.get("status") or "").upper()
-        if status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
-            return {
-                "success": True,
-                "order": order,
-                "already_exists": True,
-                "order_status": status,
-            }
-        # CANCELED/EXPIRED/REJECTED are not active protection and may be recreated.
-        return None
 
+        order = lookup.get("order") or {}
+        status = str(order.get("algoStatus") or "").upper()
+        # If the deterministic algo already exists, never duplicate it. Even a
+        # terminal status is evidence that this exact protection was submitted;
+        # account reconciliation decides whether the position still exists.
+        return {
+            "success": True,
+            "order": order,
+            "already_exists": True,
+            "algo_status": status,
+            "is_algo": True,
+        }
+
+    # ------------------------------------------------------------------
+    # Account configuration
+    # ------------------------------------------------------------------
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
         normalized = str(margin_type).upper()
         if normalized not in {"ISOLATED", "CROSSED"}:
@@ -109,7 +135,7 @@ class ExchangeAdapter:
                     "already_set": True,
                     "result": {"code": getattr(exc, "code", None), "message": message},
                 }
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -129,6 +155,9 @@ class ExchangeAdapter:
         leverage_result["margin_result"] = margin
         return leverage_result
 
+    # ------------------------------------------------------------------
+    # Entry orders: normal USD-M order endpoint
+    # ------------------------------------------------------------------
     def open_market(self, command_id: str, symbol: str, position_side: str, quantity: float) -> Dict[str, Any]:
         try:
             symbol = symbol.upper()
@@ -143,9 +172,9 @@ class ExchangeAdapter:
             }
             params.update(self._position_params(position_side))
             order = self.client.futures_create_order(**params)
-            return {"success": True, "order": order, "quantity": qty}
+            return {"success": True, "order": order, "quantity": qty, "is_algo": False}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -173,12 +202,15 @@ class ExchangeAdapter:
             }
             params.update(self._position_params(position_side))
             order = self.client.futures_create_order(**params)
-            return {"success": True, "order": order, "quantity": qty, "price": price}
+            return {"success": True, "order": order, "quantity": qty, "price": price, "is_algo": False}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # ------------------------------------------------------------------
+    # Protective conditional orders: USD-M Algo Order endpoint
+    # ------------------------------------------------------------------
     def stop_close_all(
         self,
         command_id: str,
@@ -190,30 +222,33 @@ class ExchangeAdapter:
         try:
             symbol = symbol.upper()
             client_id = self.client_order_id(command_id, suffix)
+            side = self._close_side(position_side)
+            price = self.connection.normalize_price(symbol, stop_price, "down" if side == "SELL" else "up")
+
             existing = self._existing_protection(symbol, client_id)
             if existing is not None:
                 if existing.get("success"):
-                    existing["stop_price"] = self.connection.normalize_price(symbol, stop_price, "nearest")
+                    existing["stop_price"] = price
                 return existing
 
-            side = self._close_side(position_side)
-            price = self.connection.normalize_price(symbol, stop_price, "down" if side == "SELL" else "up")
-            params = {
+            params: Dict[str, Any] = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": side,
                 "type": "STOP_MARKET",
-                "stopPrice": price,
+                "triggerPrice": price,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": client_id,
+                "clientAlgoId": client_id,
+                "newOrderRespType": "RESULT",
             }
             params.update(self._position_params(position_side))
-            order = self.client.futures_create_order(**params)
-            return {"success": True, "order": order, "stop_price": price}
+            order = self.client.futures_create_algo_order(**params)
+            return {"success": True, "order": order, "stop_price": price, "is_algo": True}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc), "is_algo": True}
         except Exception as exc:
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc), "is_algo": True}
 
     def take_profit_close_all(
         self,
@@ -226,30 +261,33 @@ class ExchangeAdapter:
         try:
             symbol = symbol.upper()
             client_id = self.client_order_id(command_id, suffix)
+            side = self._close_side(position_side)
+            price = self.connection.normalize_price(symbol, trigger_price, "down" if side == "SELL" else "up")
+
             existing = self._existing_protection(symbol, client_id)
             if existing is not None:
                 if existing.get("success"):
-                    existing["tp_price"] = self.connection.normalize_price(symbol, trigger_price, "nearest")
+                    existing["tp_price"] = price
                 return existing
 
-            side = self._close_side(position_side)
-            price = self.connection.normalize_price(symbol, trigger_price, "down" if side == "SELL" else "up")
-            params = {
+            params: Dict[str, Any] = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": side,
                 "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": price,
+                "triggerPrice": price,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": client_id,
+                "clientAlgoId": client_id,
+                "newOrderRespType": "RESULT",
             }
             params.update(self._position_params(position_side))
-            order = self.client.futures_create_order(**params)
-            return {"success": True, "order": order, "tp_price": price}
+            order = self.client.futures_create_algo_order(**params)
+            return {"success": True, "order": order, "tp_price": price, "is_algo": True}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc), "is_algo": True}
         except Exception as exc:
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc), "is_algo": True}
 
     def take_profit_partial(
         self,
@@ -263,40 +301,60 @@ class ExchangeAdapter:
         try:
             symbol = symbol.upper()
             client_id = self.client_order_id(command_id, suffix)
-            existing = self._existing_protection(symbol, client_id)
-            if existing is not None:
-                if existing.get("success"):
-                    existing["tp_price"] = self.connection.normalize_price(symbol, trigger_price, "nearest")
-                    existing["quantity"] = self.connection.normalize_quantity(symbol, quantity, market=True)
-                return existing
-
             side = self._close_side(position_side)
             qty = self.connection.normalize_quantity(symbol, quantity, market=True)
             price = self.connection.normalize_price(symbol, trigger_price, "down" if side == "SELL" else "up")
-            params = {
+
+            existing = self._existing_protection(symbol, client_id)
+            if existing is not None:
+                if existing.get("success"):
+                    existing["tp_price"] = price
+                    existing["quantity"] = qty
+                return existing
+
+            params: Dict[str, Any] = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": side,
                 "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": price,
+                "triggerPrice": price,
                 "quantity": qty,
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": client_id,
+                "clientAlgoId": client_id,
+                "newOrderRespType": "RESULT",
             }
             if self.connection.hedge_mode:
                 params["positionSide"] = position_side
             else:
-                params["reduceOnly"] = True
-            order = self.client.futures_create_order(**params)
-            return {"success": True, "order": order, "tp_price": price, "quantity": qty}
+                params["reduceOnly"] = "true"
+            order = self.client.futures_create_algo_order(**params)
+            return {
+                "success": True,
+                "order": order,
+                "tp_price": price,
+                "quantity": qty,
+                "is_algo": True,
+            }
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc), "is_algo": True}
         except Exception as exc:
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc), "is_algo": True}
 
+    # ------------------------------------------------------------------
+    # Position close remains a normal MARKET reduce order
+    # ------------------------------------------------------------------
     def close_market(self, symbol: str, position_side: str, quantity: float) -> Dict[str, Any]:
         return self.connection.close_position(symbol, quantity, position_side)
 
-    def cancel_order(self, symbol: str, order_id: Optional[int] = None, client_order_id: Optional[str] = None) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Normal order management (entries)
+    # ------------------------------------------------------------------
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if order_id is None and not client_order_id:
             return {"success": False, "error": "order_id ou client_order_id obrigatorio"}
         try:
@@ -306,13 +364,18 @@ class ExchangeAdapter:
             else:
                 params["origClientOrderId"] = client_order_id
             result = self.client.futures_cancel_order(**params)
-            return {"success": True, "order": result}
+            return {"success": True, "order": result, "is_algo": False}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            return {"success": False, "error": self._api_error(exc)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def query_order(self, symbol: str, order_id: Optional[int] = None, client_order_id: Optional[str] = None) -> Dict[str, Any]:
+    def query_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if order_id is None and not client_order_id:
             return {"success": False, "error": "order_id ou client_order_id obrigatorio"}
         try:
@@ -322,8 +385,72 @@ class ExchangeAdapter:
             else:
                 params["origClientOrderId"] = client_order_id
             order = self.client.futures_get_order(**params)
-            return {"success": True, "order": order}
+            return {"success": True, "order": order, "is_algo": False}
         except BinanceAPIException as exc:
-            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+            not_found = self._not_found_exception(exc)
+            return {"success": False, "error": self._api_error(exc), "not_found": not_found}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Algo protection management
+    # ------------------------------------------------------------------
+    def cancel_algo_order(
+        self,
+        symbol: str,
+        algo_id: Optional[int] = None,
+        client_algo_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if algo_id is None and not client_algo_id:
+            return {"success": False, "error": "algo_id ou client_algo_id obrigatorio", "is_algo": True}
+        try:
+            params: Dict[str, Any] = {"symbol": symbol.upper()}
+            if algo_id is not None:
+                params["algoId"] = int(algo_id)
+            else:
+                params["clientAlgoId"] = client_algo_id
+            order = self.client.futures_cancel_algo_order(**params)
+            return {"success": True, "order": order, "is_algo": True}
+        except BinanceAPIException as exc:
+            return {"success": False, "error": self._api_error(exc), "is_algo": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "is_algo": True}
+
+    def query_algo_order(
+        self,
+        symbol: str,
+        algo_id: Optional[int] = None,
+        client_algo_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if algo_id is None and not client_algo_id:
+            return {"success": False, "error": "algo_id ou client_algo_id obrigatorio", "is_algo": True}
+        try:
+            params: Dict[str, Any] = {"symbol": symbol.upper()}
+            if algo_id is not None:
+                params["algoId"] = int(algo_id)
+            else:
+                params["clientAlgoId"] = client_algo_id
+            order = self.client.futures_get_algo_order(**params)
+            return {"success": True, "order": order, "is_algo": True}
+        except BinanceAPIException as exc:
+            not_found = self._not_found_exception(exc)
+            return {
+                "success": False,
+                "error": self._api_error(exc),
+                "not_found": not_found,
+                "is_algo": True,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "is_algo": True}
+
+    def open_algo_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            params: Dict[str, Any] = {}
+            if symbol:
+                params["symbol"] = symbol.upper()
+            orders = self.client.futures_get_open_algo_orders(**params)
+            return {"success": True, "orders": orders, "is_algo": True}
+        except BinanceAPIException as exc:
+            return {"success": False, "error": self._api_error(exc), "is_algo": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "is_algo": True}
