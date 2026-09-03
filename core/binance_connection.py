@@ -102,13 +102,31 @@ class BinanceConnection:
         return normalized
 
     def _position_params(self, position_side: Optional[str]) -> Dict[str, Any]:
-        """Inclui positionSide somente quando necessario/seguro."""
         normalized = self._validate_position_side(position_side)
         if self.hedge_mode:
             if normalized not in {"LONG", "SHORT"}:
                 raise ValueError("Hedge Mode exige position_side LONG ou SHORT")
             return {"positionSide": normalized}
         return {}
+
+    def _infer_open_position_side(self, symbol: str) -> Optional[str]:
+        """Descobre o lado aberto quando uma chamada legada nao o informa."""
+        positions = self.client.futures_position_information(symbol=symbol)
+        active = [p for p in positions if abs(float(p.get("positionAmt", 0))) > 0]
+        if len(active) != 1:
+            return None
+
+        pos = active[0]
+        if self.hedge_mode:
+            side = str(pos.get("positionSide", "")).upper()
+            return side if side in {"LONG", "SHORT"} else None
+
+        amount = float(pos.get("positionAmt", 0))
+        if amount > 0:
+            return "LONG"
+        if amount < 0:
+            return "SHORT"
+        return None
 
     def get_price(self, symbol: str) -> Optional[float]:
         try:
@@ -157,21 +175,24 @@ class BinanceConnection:
     ) -> Dict[str, Any]:
         """Cria MARKET e pede RESULT para receber o fill final."""
         try:
+            normalized_side = side.upper()
+            if self.hedge_mode and position_side is None:
+                # Compatibilidade com o bot legado: entradas BUY=LONG, SELL=SHORT.
+                position_side = "LONG" if normalized_side == "BUY" else "SHORT"
+
             params: Dict[str, Any] = {
                 "symbol": symbol,
-                "side": side.upper(),
+                "side": normalized_side,
                 "type": "MARKET",
                 "quantity": quantity,
                 "newOrderRespType": "RESULT",
             }
             params.update(self._position_params(position_side))
-
-            # reduceOnly nao pode ser enviado em Hedge Mode.
             if reduce_only and not self.hedge_mode:
                 params["reduceOnly"] = True
 
             order = self.client.futures_create_order(**params)
-            print(f"📝 Ordem MARKET criada: {symbol} {side.upper()} {quantity}")
+            print(f"📝 Ordem MARKET criada: {symbol} {normalized_side} {quantity}")
             return {"success": True, "order": order}
         except BinanceAPIException as e:
             print(f"❌ ERRO ao criar ordem {symbol}: {e.code} - {e.message}")
@@ -185,13 +206,23 @@ class BinanceConnection:
         symbol: str,
         side: str,
         stop_price: float,
+        quantity: Optional[float] = None,
         position_side: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Cria STOP_MARKET Close-All. Nao envia quantity com closePosition=true."""
+        """
+        Cria STOP_MARKET Close-All.
+
+        `quantity` e aceito apenas para compatibilidade com o codigo antigo,
+        mas NAO e enviado porque a Binance proibe quantity + closePosition=true.
+        """
         try:
+            normalized_side = side.upper()
+            if self.hedge_mode and position_side is None:
+                position_side = "LONG" if normalized_side == "SELL" else "SHORT"
+
             params: Dict[str, Any] = {
                 "symbol": symbol,
-                "side": side.upper(),
+                "side": normalized_side,
                 "type": "STOP_MARKET",
                 "stopPrice": stop_price,
                 "closePosition": "true",
@@ -213,13 +244,18 @@ class BinanceConnection:
         symbol: str,
         side: str,
         tp_price: float,
+        quantity: Optional[float] = None,
         position_side: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Cria TAKE_PROFIT_MARKET Close-All. Nao envia quantity com closePosition=true."""
+        """TAKE_PROFIT_MARKET Close-All; quantity legado e ignorado com seguranca."""
         try:
+            normalized_side = side.upper()
+            if self.hedge_mode and position_side is None:
+                position_side = "LONG" if normalized_side == "SELL" else "SHORT"
+
             params: Dict[str, Any] = {
                 "symbol": symbol,
-                "side": side.upper(),
+                "side": normalized_side,
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": tp_price,
                 "closePosition": "true",
@@ -240,13 +276,18 @@ class BinanceConnection:
         self,
         symbol: str,
         quantity: float,
-        position_side: str,
+        position_side: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fecha explicitamente LONG ou SHORT com MARKET."""
+        """Fecha LONG/SHORT com MARKET; descobre o lado se uma chamada legada omitir."""
         try:
             normalized = self._validate_position_side(position_side)
+            if normalized is None:
+                normalized = self._infer_open_position_side(symbol)
             if normalized not in {"LONG", "SHORT"}:
-                raise ValueError("close_position exige LONG ou SHORT")
+                return {
+                    "success": False,
+                    "error": "Nao foi possivel determinar unicamente se a posicao e LONG ou SHORT",
+                }
 
             close_side = "SELL" if normalized == "LONG" else "BUY"
             params: Dict[str, Any] = {
@@ -283,7 +324,7 @@ class BinanceConnection:
             return {"success": False, "error": str(e)}
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """Define leverage usando o endpoint TRADE correto: POST /fapi/v1/leverage."""
+        """Define leverage usando POST /fapi/v1/leverage."""
         try:
             if not 1 <= int(leverage) <= 125:
                 return {"success": False, "error": f"Leverage invalido: {leverage}"}
