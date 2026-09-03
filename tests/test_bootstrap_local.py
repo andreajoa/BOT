@@ -10,7 +10,7 @@ from utils.tls import create_ssl_context
 
 
 class BootstrapLocalTests(unittest.TestCase):
-    def test_env_update_preserves_other_values_and_sets_mode(self):
+    def test_env_update_preserves_other_values_and_sets_external_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
             env_path.write_text("BINANCEAPIKEY=secret-binance\nBOT_MODE=paper\n", encoding="utf-8")
@@ -18,12 +18,19 @@ class BootstrapLocalTests(unittest.TestCase):
             bootstrap_local.ENV_FILE = env_path
             try:
                 bootstrap_local._set_env_file_value("BOT_MODE", "live")
-                bootstrap_local._set_env_file_value("OPENAI_API_KEY", "sk-test-value-123456789012345")
+                bootstrap_local._set_env_file_value("BRAIN_MODE", "external_chatgpt")
+                bootstrap_local._set_env_file_value(
+                    "NEON_DATABASE_URL",
+                    "postgresql://user:secret@example.neon.tech/db?sslmode=require",
+                )
                 text = env_path.read_text(encoding="utf-8")
                 self.assertIn("BINANCEAPIKEY=secret-binance", text)
                 self.assertIn("BOT_MODE=live", text)
-                self.assertIn("OPENAI_API_KEY=sk-test-value-123456789012345", text)
+                self.assertIn("BRAIN_MODE=external_chatgpt", text)
+                self.assertIn("NEON_DATABASE_URL=postgresql://", text)
+                self.assertNotIn("OPENAI_API_KEY", text)
                 self.assertEqual(bootstrap_local._env_file_value("BOT_MODE"), "live")
+                self.assertEqual(bootstrap_local._env_file_value("BRAIN_MODE"), "external_chatgpt")
             finally:
                 bootstrap_local.ENV_FILE = old
 
