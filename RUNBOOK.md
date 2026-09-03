@@ -12,17 +12,21 @@ O antigo bot de Mean Reversion permanece apenas como legado/referência e não �
 - O executor não escolhe estratégia.
 - Toda nova ordem real exige aprovação específica para o `command_id` correspondente.
 - Chaves Binance/OpenAI ficam apenas no `.env` local e nunca no GitHub.
+- Toda nova entrada força margem `ISOLATED` antes de configurar leverage.
+- O Risk Governor limita a perda estimada até o stop, incluindo uma estimativa de taxas.
 - SL/TP/trailing são instalados e geridos pelo executor após confirmação de fill.
 - Uma entrada LIMIT só recebe proteção depois do fill real.
 - Entradas pendentes sobrevivem a restart e são reconciliadas por `newClientOrderId` determinístico.
 
 ## 1. Atualizar o código local
 
+Após a promoção final da branch para `main`:
+
 ```bash
 cd ~/Downloads/Organizados/Pessoal-Andre/coder/mercado_lateral || exit 1
 git fetch origin
-git checkout dev/adaptive-executor
-git pull --ff-only origin dev/adaptive-executor
+git checkout main
+git pull --ff-only origin main
 python3 -m pip install -r requirements.txt
 ```
 
@@ -43,6 +47,8 @@ MAX_LEVERAGE_HARD=20
 MAX_MARGIN_USAGE_PCT=0.95
 SINGLE_POSITION_BELOW_USDT=5.0
 MAX_OPEN_POSITIONS_HARD=3
+MAX_LOSS_PCT_BALANCE_HARD=0.35
+ESTIMATED_TAKER_FEE_RATE=0.0005
 SCANNER_MAX_SYMBOLS=15
 BRAIN_DECISION_INTERVAL_SECONDS=20
 BRAIN_COMMAND_TTL_SECONDS=90
@@ -130,6 +136,7 @@ A trilha deve permitir identificar:
 - comando recebido;
 - preflight;
 - aprovação consumida;
+- margem isolada;
 - leverage;
 - ordem de entrada;
 - fill/rejeição;
@@ -176,9 +183,11 @@ Todos ficam ignorados pelo Git:
 
 Antes da primeira entrada:
 
-1. CI da branch verde.
-2. `live_preflight.py --brain` com `ok=true`.
+1. CI final verde e código promovido para `main`.
+2. `live_preflight.py --brain` com `ok=true` e `orders_sent=0`.
 3. Runtime com `market_stream_connected=true` e `user_stream_connected=true`.
 4. `decision_ready=true`.
-5. Proposta concreta revisada e aprovada pelo `command_id`.
-6. Confirmar no journal que entrada e proteção foram instaladas.
+5. Proposta concreta passando o hard limit de perda até o stop.
+6. Proposta revisada e aprovada pelo `command_id` exato.
+7. Confirmar que a entrada está em `ISOLATED`.
+8. Confirmar fill + SL + TP no journal/estado da Binance.
