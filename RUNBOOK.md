@@ -2,7 +2,7 @@
 
 ## Estado do sistema
 
-O caminho principal agora é `main.py -> adaptive_runtime.py`.
+O caminho principal agora é `main.py -> production_runtime.py -> adaptive_runtime.py`.
 O antigo bot de Mean Reversion permanece apenas como legado/referência e não é o cérebro do runtime adaptativo.
 
 ## Princípios
@@ -14,8 +14,11 @@ O antigo bot de Mean Reversion permanece apenas como legado/referência e não �
 - Chaves Binance/OpenAI ficam apenas no `.env` local e nunca no GitHub.
 - Toda nova entrada força margem `ISOLATED` antes de configurar leverage.
 - O Risk Governor limita a perda estimada até o stop, incluindo uma estimativa de taxas.
-- SL/TP/trailing são instalados e geridos pelo executor após confirmação de fill.
-- Uma entrada LIMIT só recebe proteção depois do fill real.
+- A intenção de entrada é persistida antes do request de rede.
+- Se a resposta da Binance for ambígua, a mesma entrada nunca é reenviada às cegas; o executor consulta o `clientOrderId` determinístico.
+- Uma entrada `PARTIALLY_FILLED` tem o restante cancelado e a quantidade já executada recebe proteção imediatamente.
+- Uma LIMIT ainda `NEW` é cancelada quando o TTL do comando expira.
+- SL/TP/trailing são instalados e geridos pelo executor após confirmação de quantidade realmente executada.
 - Entradas pendentes sobrevivem a restart e são reconciliadas por `newClientOrderId` determinístico.
 - IDs de entrada, SL, TP e trailing são deterministicamente diferentes mesmo quando o `command_id` real tem 32 caracteres.
 
@@ -90,7 +93,8 @@ O runtime inicia:
 - Brain Client;
 - Risk Governor;
 - approval gateway;
-- executor;
+- executor transacional/crash-safe;
+- recovery de entradas pendentes;
 - Position Manager/trailing;
 - journal/status.
 
@@ -137,8 +141,10 @@ A trilha deve permitir identificar:
 - aprovação consumida;
 - margem isolada;
 - leverage;
+- intenção de entrada persistida;
 - ordem de entrada;
-- fill/rejeição;
+- fill/rejeição/estado ambíguo;
+- cancelamento de remainder em fill parcial;
 - stop;
 - take profits;
 - trailing;
@@ -188,7 +194,7 @@ Se o processo cair:
 python3 main.py
 ```
 
-O runtime recarrega posições geridas e entradas LIMIT pendentes. O executor consulta a Binance usando `newClientOrderId` determinístico antes de reenviar entrada ou proteção, reduzindo risco de duplicidade.
+O executor recarrega qualquer intenção/entrada pendente, consulta a Binance pelo `newClientOrderId` determinístico e resolve o estado sem reenvio cego. Se a ordem estiver preenchida, instala proteção; se estiver parcialmente preenchida, cancela o restante e protege a quantidade executada; se estiver `NEW` e o TTL tiver vencido, cancela a entrada.
 
 ## 10. Kill switch manual
 
