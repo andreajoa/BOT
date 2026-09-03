@@ -1,7 +1,9 @@
 # Crypto Trader Bot - Adaptive Binance Futures Executor
 
 # Binance API / REST
-python-binance>=1.0.19
+# 1.0.37 adds USD-M futures_create/get/cancel_algo_order for the post-2025
+# conditional-order migration (TP/SL/trailing -> /fapi/v1/algoOrder).
+python-binance>=1.0.37
 
 # WebSocket publico/privado Binance USD-M
 websockets>=14.0
