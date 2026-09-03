@@ -39,6 +39,48 @@ class ExchangeAdapter:
     def _close_side(position_side: str) -> str:
         return "SELL" if position_side == "LONG" else "BUY"
 
+    def _lookup_client_order(self, symbol: str, client_order_id: str) -> Dict[str, Any]:
+        """Pre-create idempotency check.
+
+        -2013 is the normal "order does not exist" result and permits creation.
+        Any other lookup error fails closed because creating after an ambiguous
+        network/API failure could duplicate a protection order.
+        """
+        try:
+            order = self.client.futures_get_order(
+                symbol=symbol.upper(),
+                origClientOrderId=client_order_id,
+            )
+            return {"ok": True, "found": True, "order": order}
+        except BinanceAPIException as exc:
+            if getattr(exc, "code", None) == -2013:
+                return {"ok": True, "found": False}
+            return {"ok": False, "found": False, "error": f"{exc.code}: {exc.message}"}
+        except Exception as exc:
+            return {"ok": False, "found": False, "error": str(exc)}
+
+    def _existing_protection(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        lookup = self._lookup_client_order(symbol, client_order_id)
+        if not lookup.get("ok"):
+            return {
+                "success": False,
+                "error": "PROTECTION_IDEMPOTENCY_CHECK_FAILED",
+                "details": lookup,
+            }
+        if not lookup.get("found"):
+            return None
+        order = lookup.get("order") or {}
+        status = str(order.get("status") or "").upper()
+        if status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+            return {
+                "success": True,
+                "order": order,
+                "already_exists": True,
+                "order_status": status,
+            }
+        # CANCELED/EXPIRED/REJECTED are not active protection and may be recreated.
+        return None
+
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
         normalized = str(margin_type).upper()
         if normalized not in {"ISOLATED", "CROSSED"}:
@@ -51,7 +93,6 @@ class ExchangeAdapter:
             return {"success": True, "margin_type": normalized, "result": result}
         except BinanceAPIException as exc:
             message = str(getattr(exc, "message", "") or "")
-            # Binance code -4046 means the symbol already has the requested type.
             if getattr(exc, "code", None) == -4046 or "No need to change margin type" in message:
                 return {
                     "success": True,
@@ -64,8 +105,6 @@ class ExchangeAdapter:
             return {"success": False, "error": str(exc)}
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        # Force isolated margin before leverage/entry so the planned margin is not
-        # silently exposed to unrelated account equity through CROSS mode.
         margin = self.set_margin_type(symbol, "ISOLATED")
         if not margin.get("success"):
             return {
@@ -141,6 +180,13 @@ class ExchangeAdapter:
     ) -> Dict[str, Any]:
         try:
             symbol = symbol.upper()
+            client_id = self.client_order_id(command_id, suffix)
+            existing = self._existing_protection(symbol, client_id)
+            if existing is not None:
+                if existing.get("success"):
+                    existing["stop_price"] = self.connection.normalize_price(symbol, stop_price, "nearest")
+                return existing
+
             side = self._close_side(position_side)
             price = self.connection.normalize_price(symbol, stop_price, "down" if side == "SELL" else "up")
             params = {
@@ -150,7 +196,7 @@ class ExchangeAdapter:
                 "stopPrice": price,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": self.client_order_id(command_id, suffix),
+                "newClientOrderId": client_id,
             }
             params.update(self._position_params(position_side))
             order = self.client.futures_create_order(**params)
@@ -170,6 +216,13 @@ class ExchangeAdapter:
     ) -> Dict[str, Any]:
         try:
             symbol = symbol.upper()
+            client_id = self.client_order_id(command_id, suffix)
+            existing = self._existing_protection(symbol, client_id)
+            if existing is not None:
+                if existing.get("success"):
+                    existing["tp_price"] = self.connection.normalize_price(symbol, trigger_price, "nearest")
+                return existing
+
             side = self._close_side(position_side)
             price = self.connection.normalize_price(symbol, trigger_price, "down" if side == "SELL" else "up")
             params = {
@@ -179,7 +232,7 @@ class ExchangeAdapter:
                 "stopPrice": price,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": self.client_order_id(command_id, suffix),
+                "newClientOrderId": client_id,
             }
             params.update(self._position_params(position_side))
             order = self.client.futures_create_order(**params)
@@ -200,6 +253,14 @@ class ExchangeAdapter:
     ) -> Dict[str, Any]:
         try:
             symbol = symbol.upper()
+            client_id = self.client_order_id(command_id, suffix)
+            existing = self._existing_protection(symbol, client_id)
+            if existing is not None:
+                if existing.get("success"):
+                    existing["tp_price"] = self.connection.normalize_price(symbol, trigger_price, "nearest")
+                    existing["quantity"] = self.connection.normalize_quantity(symbol, quantity, market=True)
+                return existing
+
             side = self._close_side(position_side)
             qty = self.connection.normalize_quantity(symbol, quantity, market=True)
             price = self.connection.normalize_price(symbol, trigger_price, "down" if side == "SELL" else "up")
@@ -210,7 +271,7 @@ class ExchangeAdapter:
                 "stopPrice": price,
                 "quantity": qty,
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": self.client_order_id(command_id, suffix),
+                "newClientOrderId": client_id,
             }
             if self.connection.hedge_mode:
                 params["positionSide"] = position_side
