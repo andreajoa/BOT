@@ -4,12 +4,9 @@
 Cria um ambiente virtual isolado em .venv, instala/atualiza as dependencias,
 configura somente o .env LOCAL e inicia o fluxo live protegido.
 
-O bootstrap nao envia ordens. Ativar BOT_MODE=live tambem nao aprova trade:
-cada nova operacao real continua exigindo a frase exata
-``APROVAR <command_id>`` dentro de go_live_guarded.py.
-
-Uso:
-    python3 scripts/bootstrap_local.py
+No modo padrao BRAIN_MODE=external_chatgpt nao existe OPENAI_API_KEY: o runtime
+publica estado em Neon privado e aguarda propostas externas. Cada nova operacao
+real continua exigindo a aprovacao exata do command_id.
 """
 
 from __future__ import annotations
@@ -95,6 +92,23 @@ def _set_env_file_value(key: str, value: str) -> None:
 
 def _configure_local_runtime() -> int:
     """Resolve local-only settings without ever printing secrets."""
+    # This project now defaults to the external ChatGPT bridge. No OpenAI API
+    # key is requested or required in this mode.
+    _set_env_file_value("BRAIN_MODE", "external_chatgpt")
+    print("\nBRAIN_MODE=external_chatgpt (sem OPENAI_API_KEY).")
+
+    neon_url = (os.getenv("NEON_DATABASE_URL") or _env_file_value("NEON_DATABASE_URL") or "").strip()
+    if not neon_url:
+        print("\nNEON_DATABASE_URL nao encontrada.")
+        print("Cole a connection string do projeto privado Neon 'binance-bot-telemetry'.")
+        print("A entrada fica oculta e sera salva SOMENTE no .env local.")
+        value = getpass.getpass("NEON_DATABASE_URL: ").strip()
+        if not value.startswith(("postgres://", "postgresql://")):
+            print("Connection string Neon ausente/invalida. Encerrando sem enviar ordens.")
+            return 6
+        _set_env_file_value("NEON_DATABASE_URL", value)
+        print("NEON_DATABASE_URL salva localmente (valor nao exibido).")
+
     current_mode = (_env_file_value("BOT_MODE") or "disabled").strip().lower()
     if current_mode != "live":
         print(f"\nBOT_MODE atual: {current_mode}")
@@ -106,17 +120,6 @@ def _configure_local_runtime() -> int:
             return 5
         _set_env_file_value("BOT_MODE", "live")
         print("BOT_MODE=live salvo somente no .env local.")
-
-    openai_key = (os.getenv("OPENAI_API_KEY") or _env_file_value("OPENAI_API_KEY") or "").strip()
-    if not openai_key:
-        print("\nOPENAI_API_KEY nao encontrada.")
-        print("Cole a chave OpenAI abaixo. A entrada fica oculta e sera salva SOMENTE no .env local.")
-        key = getpass.getpass("OPENAI_API_KEY: ").strip()
-        if len(key) < 20:
-            print("Chave ausente/invalida. Encerrando sem enviar ordens.")
-            return 6
-        _set_env_file_value("OPENAI_API_KEY", key)
-        print("OPENAI_API_KEY salva localmente (valor nao exibido).")
 
     return 0
 
