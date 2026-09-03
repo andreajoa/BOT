@@ -28,7 +28,7 @@ class StructureSampler:
         interval_seconds: int = 30,
         concurrency: int = 8,
     ):
-        self.symbols = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+        self.symbols = self._normalize_symbols(symbols)
         self.intervals = tuple(intervals)
         self.kline_limit = max(50, int(kline_limit))
         self.interval_seconds = max(10, int(interval_seconds))
@@ -38,6 +38,19 @@ class StructureSampler:
         self.state: Dict[str, Dict[str, Any]] = {}
         self.last_update_ms = 0
         self.last_error: Optional[str] = None
+
+    @staticmethod
+    def _normalize_symbols(symbols: Iterable[str]) -> List[str]:
+        result = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+        if not result:
+            raise ValueError("Informe ao menos um simbolo")
+        return result
+
+    async def replace_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = self._normalize_symbols(symbols)
+        async with self._lock:
+            self.symbols = normalized
+            self.state = {s: self.state[s] for s in normalized if s in self.state}
 
     @staticmethod
     def _get_json_sync(url: str) -> Any:
@@ -153,16 +166,20 @@ class StructureSampler:
         }
 
     async def sample_once(self) -> Dict[str, Any]:
-        results = await asyncio.gather(*(self.sample_symbol(s) for s in self.symbols), return_exceptions=True)
+        async with self._lock:
+            symbols = list(self.symbols)
+        results = await asyncio.gather(*(self.sample_symbol(s) for s in symbols), return_exceptions=True)
         update: Dict[str, Any] = {}
         errors = []
-        for symbol, result in zip(self.symbols, results):
+        for symbol, result in zip(symbols, results):
             if isinstance(result, Exception):
                 errors.append(f"{symbol}: {result}")
             else:
                 update[symbol] = result
         async with self._lock:
-            self.state.update(update)
+            active = set(self.symbols)
+            self.state.update({k: v for k, v in update.items() if k in active})
+            self.state = {s: self.state[s] for s in self.symbols if s in self.state}
             self.last_update_ms = int(time.time() * 1000)
             self.last_error = " | ".join(errors) if errors else None
             return deepcopy(self.state)
