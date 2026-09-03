@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Live infrastructure preflight. NEVER sends an order.
+"""Live infrastructure preflight. NEVER sends a Binance order.
 
-Validates local secrets/configuration, Binance USD-M connectivity, executable
-universe for the current balance, public WebSocket data, derivatives/structure
-samplers, private account read access and optional OpenAI Responses API access.
-
-Usage:
-    python scripts/live_preflight.py
-    python scripts/live_preflight.py --brain
+Validates local configuration, Binance USD-M connectivity, executable universe,
+public market data and the configured brain transport:
+- external_chatgpt -> private Neon bridge
+- openai_api       -> optional OpenAI Responses API
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ if str(ROOT) not in sys.path:
 
 from config.settings import BINANCE_API_KEY, BINANCE_API_SECRET, BOT_MODE
 from core.binance_connection import BinanceConnection
-from intelligence.brain_client import BrainClient
 from market.context_builder import MarketContextBuilder
 from market.derivatives_sampler import DerivativesSampler
 from market.live_stream import FuturesMarketStream
@@ -151,28 +147,73 @@ def _check_openai() -> Dict[str, Any]:
         return _result("openai_responses_api", False, error=str(exc))
 
 
+def _check_neon() -> Dict[str, Any]:
+    database_url = (os.getenv("NEON_DATABASE_URL") or "").strip()
+    if not database_url:
+        return _result("neon_private_bridge", False, error="NEON_DATABASE_URL missing")
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(
+            database_url,
+            autocommit=True,
+            connect_timeout=10,
+            row_factory=dict_row,
+            application_name="adaptive-binance-preflight",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_database() AS db, now() AS server_time")
+                row = cur.fetchone() or {}
+                cur.execute("SELECT to_regclass('public.bot_runtime_state') AS runtime_table, to_regclass('public.brain_proposals') AS proposals_table")
+                tables = cur.fetchone() or {}
+        ok = bool(tables.get("runtime_table") and tables.get("proposals_table"))
+        return _result(
+            "neon_private_bridge",
+            ok,
+            database=row.get("db"),
+            runtime_table=bool(tables.get("runtime_table")),
+            proposals_table=bool(tables.get("proposals_table")),
+        )
+    except Exception as exc:
+        return _result("neon_private_bridge", False, error=str(exc))
+
+
 async def main_async(test_brain: bool = False) -> int:
     checks: List[Dict[str, Any]] = []
+    brain_mode = (os.getenv("BRAIN_MODE") or "external_chatgpt").strip().lower()
     checks.append(_result("bot_mode_live", BOT_MODE == "live", bot_mode=BOT_MODE))
     checks.append(
         _result(
+            "brain_mode",
+            brain_mode in {"external_chatgpt", "openai_api"},
+            brain_mode=brain_mode,
+        )
+    )
+
+    base_secrets_ok = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
+    mode_secret_ok = bool(os.getenv("NEON_DATABASE_URL")) if brain_mode == "external_chatgpt" else bool(os.getenv("OPENAI_API_KEY"))
+    checks.append(
+        _result(
             "local_secrets_present",
-            bool(BINANCE_API_KEY and BINANCE_API_SECRET and os.getenv("OPENAI_API_KEY")),
+            base_secrets_ok and mode_secret_ok,
             binance_key=bool(BINANCE_API_KEY),
             binance_secret=bool(BINANCE_API_SECRET),
-            openai_key=bool(os.getenv("OPENAI_API_KEY")),
+            neon_database_url=bool(os.getenv("NEON_DATABASE_URL")),
+            openai_key_required=(brain_mode == "openai_api"),
+            openai_key=bool(os.getenv("OPENAI_API_KEY")) if brain_mode == "openai_api" else None,
         )
     )
 
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        print(json.dumps({"ok": False, "checks": checks}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": False, "orders_sent": 0, "checks": checks}, ensure_ascii=False, indent=2))
         return 2
 
     conn = BinanceConnection(BINANCE_API_KEY, BINANCE_API_SECRET)
     connected = await asyncio.to_thread(conn.connect)
     checks.append(_result("binance_futures_connection", connected))
     if not connected:
-        print(json.dumps({"ok": False, "checks": checks}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": False, "orders_sent": 0, "checks": checks}, ensure_ascii=False, indent=2))
         return 3
 
     balance = await asyncio.to_thread(conn.get_usdt_balance)
@@ -218,14 +259,12 @@ async def main_async(test_brain: bool = False) -> int:
         sample_symbols = [row["symbol"] for row in universe[: min(3, len(universe))]]
         checks.extend(await _market_checks(sample_symbols))
 
-    if test_brain:
+    if brain_mode == "external_chatgpt":
+        checks.append(await asyncio.to_thread(_check_neon))
+    elif test_brain:
         checks.append(await asyncio.to_thread(_check_openai))
     else:
-        try:
-            BrainClient()
-            checks.append(_result("brain_client_configuration", True, model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol")))
-        except Exception as exc:
-            checks.append(_result("brain_client_configuration", False, error=str(exc)))
+        checks.append(_result("openai_api_configuration", bool(os.getenv("OPENAI_API_KEY"))))
 
     overall = all(item.get("ok") for item in checks)
     payload = {
@@ -234,13 +273,13 @@ async def main_async(test_brain: bool = False) -> int:
         "note": "This diagnostic never calls a Binance order endpoint.",
         "checks": checks,
     }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     return 0 if overall else 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--brain", action="store_true", help="also make one harmless OpenAI Responses API call")
+    parser.add_argument("--brain", action="store_true", help="for openai_api mode, also make one harmless Responses API call")
     args = parser.parse_args()
     raise SystemExit(asyncio.run(main_async(test_brain=args.brain)))
 
