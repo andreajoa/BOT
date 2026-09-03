@@ -124,7 +124,7 @@ def _approval(command_id="cmd-exec"):
 
 
 class CommandExecutorTests(unittest.TestCase):
-    def _executor(self, adapter=None, root=None):
+    def _executor(self, adapter=None, root=None, recover_on_init=True):
         if root is None:
             tmp = tempfile.TemporaryDirectory()
             self.addCleanup(tmp.cleanup)
@@ -136,6 +136,7 @@ class CommandExecutorTests(unittest.TestCase):
             adapter=adapter or _Adapter(),
             journal=journal,
             pending_path=os.path.join(root, "pending_entries.json"),
+            recover_on_init=recover_on_init,
         )
 
     def test_missing_approval_rejects_before_exchange(self):
@@ -179,7 +180,7 @@ class CommandExecutorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "STOP_LOSS_INSTALL_FAILED")
         self.assertIn("close", [c[0] for c in adapter.calls])
 
-    def test_limit_pending_survives_restart_and_recovers_fill(self):
+    def test_limit_pending_survives_restart_and_auto_recovers_fill(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         adapter = _Adapter()
@@ -192,11 +193,19 @@ class CommandExecutorTests(unittest.TestCase):
         adapter.orders[client_id]["executedQty"] = "5"
 
         restarted = self._executor(adapter, tmp.name)
-        self.assertIn(client_id, restarted.pending_entries)
-        outcomes = restarted.recover_pending_entries()
-        self.assertEqual(outcomes[client_id]["status"], "RECOVERED_EXECUTED")
         self.assertNotIn(client_id, restarted.pending_entries)
+        self.assertEqual(restarted.recovery_outcomes[client_id]["status"], "RECOVERED_EXECUTED")
         self.assertIn("sl", [c[0] for c in adapter.calls])
+
+    def test_can_load_without_auto_recovery_for_inspection(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        adapter = _Adapter()
+        executor = self._executor(adapter, tmp.name)
+        executor.execute(_command(EntryType.LIMIT), _approval(), {})
+        restarted = self._executor(adapter, tmp.name, recover_on_init=False)
+        self.assertIn("brain_cmd-exec_entry", restarted.pending_entries)
+        self.assertEqual(restarted.recovery_outcomes, {})
 
     def test_existing_entry_client_id_prevents_duplicate_order(self):
         adapter = _Adapter()
