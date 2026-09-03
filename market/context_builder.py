@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Transforma o fluxo bruto da Binance em contexto compacto para decisao."""
+"""Transforma dados publicos da Binance em contexto compacto para decisao."""
 
 from __future__ import annotations
 
@@ -7,14 +7,19 @@ from typing import Dict, Iterable, List, Optional
 
 
 class MarketContextBuilder:
-    """Calcula microestrutura simples sem impor estrategia ou direcao."""
+    """Enriquece microestrutura/derivativos/estrutura sem impor estrategia ou direcao."""
 
     @staticmethod
     def _safe_div(num: float, den: float, default: float = 0.0) -> float:
         return num / den if den else default
 
     @classmethod
-    def enrich_symbol(cls, raw: Dict, derivatives: Optional[Dict] = None) -> Dict:
+    def enrich_symbol(
+        cls,
+        raw: Dict,
+        derivatives: Optional[Dict] = None,
+        structure: Optional[Dict] = None,
+    ) -> Dict:
         bid = raw.get("best_bid")
         ask = raw.get("best_ask")
         bid_qty = raw.get("best_bid_qty") or 0.0
@@ -39,6 +44,8 @@ class MarketContextBuilder:
         flow_300 = raw.get("flow_300s") or {}
         stale_ms = raw.get("stale_ms")
         d = derivatives or {}
+        s = structure or {}
+        timeframes = dict(s.get("timeframes") or {})
 
         quality_flags: List[str] = []
         if bid is None or ask is None:
@@ -49,6 +56,8 @@ class MarketContextBuilder:
             quality_flags.append("NO_MARK")
         if stale_ms is None or stale_ms > 5_000:
             quality_flags.append("STALE")
+        if not timeframes:
+            quality_flags.append("NO_STRUCTURE")
 
         return {
             "symbol": raw.get("symbol"),
@@ -68,10 +77,13 @@ class MarketContextBuilder:
             "basis_bps": basis_bps,
             "next_funding_time_ms": raw.get("next_funding_time_ms"),
             "open_interest": d.get("open_interest"),
+            "open_interest_change_pct": d.get("open_interest_change_pct"),
             "global_long_short_ratio": d.get("global_long_short_ratio"),
             "top_account_long_short_ratio": d.get("top_account_long_short_ratio"),
             "top_position_long_short_ratio": d.get("top_position_long_short_ratio"),
             "derivatives_captured_at_ms": d.get("captured_at_ms"),
+            "structure_captured_at_ms": s.get("captured_at_ms"),
+            "timeframes": timeframes,
             "stale_ms": stale_ms,
             "data_quality": "OK" if not quality_flags else "DEGRADED",
             "quality_flags": quality_flags,
@@ -84,18 +96,27 @@ class MarketContextBuilder:
         symbols: Optional[Iterable[str]] = None,
         max_symbols: Optional[int] = None,
         derivatives_snapshot: Optional[Dict] = None,
+        structure_snapshot: Optional[Dict] = None,
     ) -> Dict:
         source = snapshot.get("symbols") or {}
         derivatives_source = (derivatives_snapshot or {}).get("symbols") or {}
+        structure_source = (structure_snapshot or {}).get("symbols") or {}
         allowed = {str(s).upper() for s in symbols} if symbols else None
 
         rows = []
         for symbol, raw in source.items():
-            if allowed is not None and symbol.upper() not in allowed:
+            symbol_key = symbol.upper()
+            if allowed is not None and symbol_key not in allowed:
                 continue
-            rows.append(cls.enrich_symbol(raw, derivatives_source.get(symbol.upper())))
+            rows.append(
+                cls.enrich_symbol(
+                    raw,
+                    derivatives_source.get(symbol_key),
+                    structure_source.get(symbol_key),
+                )
+            )
 
-        # Activity is only a sorting heuristic; it is not a trading signal.
+        # Ordenacao por atividade e apenas um criterio de compactacao, nao sinal de trade.
         rows.sort(key=lambda x: x.get("taker_quote_60s") or 0.0, reverse=True)
         if max_symbols is not None:
             rows = rows[: max(0, int(max_symbols))]
@@ -108,5 +129,7 @@ class MarketContextBuilder:
             "market_stream_last_error": snapshot.get("last_error"),
             "derivatives_last_update_ms": (derivatives_snapshot or {}).get("last_update_ms"),
             "derivatives_last_error": (derivatives_snapshot or {}).get("last_error"),
+            "structure_last_update_ms": (structure_snapshot or {}).get("last_update_ms"),
+            "structure_last_error": (structure_snapshot or {}).get("last_error"),
             "symbols": rows,
         }
