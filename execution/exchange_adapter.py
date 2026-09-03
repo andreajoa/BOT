@@ -7,6 +7,7 @@ into exact Binance order requests and returns structured results.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Dict, Optional
 
@@ -20,9 +21,17 @@ class ExchangeAdapter:
 
     @staticmethod
     def client_order_id(command_id: str, suffix: str) -> str:
-        raw = f"brain_{command_id}_{suffix}"
-        cleaned = re.sub(r"[^.A-Z:/a-z0-9_-]", "_", raw)
-        return cleaned[:36]
+        """Return a deterministic Binance-safe client id that preserves order role.
+
+        Binance caps ``newClientOrderId`` at 36 chars. Real command ids are UUID-like
+        32-char values, so simply truncating ``brain_<command>_<suffix>`` can remove
+        the suffix entirely and make entry/SL/TP collide. We instead hash the full
+        command id and reserve explicit space for the role suffix.
+        """
+        digest = hashlib.sha256(str(command_id).encode("utf-8")).hexdigest()[:18]
+        role = re.sub(r"[^.A-Z:/a-z0-9_-]", "_", str(suffix))[:10] or "order"
+        value = f"brain_{digest}_{role}"
+        return value[:36]
 
     def _position_params(self, position_side: str) -> Dict[str, Any]:
         if self.connection.hedge_mode:
