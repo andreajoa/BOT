@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """Bootstrap local seguro para macOS/Linux com PEP 668.
 
-Cria um ambiente virtual isolado em .venv, instala/atualiza as dependencias
-somente dentro dele e inicia o fluxo live protegido.
+Cria um ambiente virtual isolado em .venv, instala/atualiza as dependencias,
+configura somente o .env LOCAL e inicia o fluxo live protegido.
 
-Nao envia ordens durante o bootstrap. A eventual ordem real continua exigindo
-a aprovacao exata do command_id dentro de go_live_guarded.py.
+O bootstrap nao envia ordens. Ativar BOT_MODE=live tambem nao aprova trade:
+cada nova operacao real continua exigindo a frase exata
+``APROVAR <command_id>`` dentro de go_live_guarded.py.
 
 Uso:
     python3 scripts/bootstrap_local.py
@@ -13,24 +14,121 @@ Uso:
 
 from __future__ import annotations
 
+import getpass
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
+ENV_FILE = ROOT / ".env"
+TLS_BOOTSTRAP = ROOT / "runtime_bootstrap"
 
 
-def run(args: list[str]) -> None:
+def run(args: list[str], *, env: Optional[dict[str, str]] = None) -> None:
     print("+", " ".join(str(x) for x in args), flush=True)
-    subprocess.run(args, cwd=str(ROOT), check=True)
+    subprocess.run(args, cwd=str(ROOT), check=True, env=env)
 
 
 def venv_python() -> Path:
     if os.name == "nt":
         return VENV / "Scripts" / "python.exe"
     return VENV / "bin" / "python"
+
+
+def _env_file_value(key: str) -> Optional[str]:
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*)$")
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = pattern.match(line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'\"', "'"}:
+            value = value[1:-1]
+        return value
+    return None
+
+
+def _set_env_file_value(key: str, value: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"Valor invalido para {key}")
+    try:
+        original = ENV_FILE.read_text(encoding="utf-8")
+    except OSError:
+        original = ""
+    lines = original.splitlines()
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    replacement = f"{key}={value}"
+    replaced = False
+    output = []
+    for line in lines:
+        if pattern.match(line) and not replaced:
+            output.append(replacement)
+            replaced = True
+        else:
+            output.append(line)
+    if not replaced:
+        if output and output[-1].strip():
+            output.append("")
+        output.append(replacement)
+    temp = ENV_FILE.with_name(".env.bootstrap.tmp")
+    temp.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(temp, 0o600)
+    except OSError:
+        pass
+    temp.replace(ENV_FILE)
+    try:
+        os.chmod(ENV_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _configure_local_runtime() -> int:
+    """Resolve local-only settings without ever printing secrets."""
+    current_mode = (_env_file_value("BOT_MODE") or "disabled").strip().lower()
+    if current_mode != "live":
+        print(f"\nBOT_MODE atual: {current_mode}")
+        print("Para habilitar o executor real, digite exatamente: ATIVAR LIVE")
+        print("Isso NAO aprova nenhuma operacao; cada command_id continua exigindo aprovacao propria.")
+        phrase = input("> ").strip()
+        if phrase != "ATIVAR LIVE":
+            print("LIVE nao ativado. Encerrando sem enviar ordens.")
+            return 5
+        _set_env_file_value("BOT_MODE", "live")
+        print("BOT_MODE=live salvo somente no .env local.")
+
+    openai_key = (os.getenv("OPENAI_API_KEY") or _env_file_value("OPENAI_API_KEY") or "").strip()
+    if not openai_key:
+        print("\nOPENAI_API_KEY nao encontrada.")
+        print("Cole a chave OpenAI abaixo. A entrada fica oculta e sera salva SOMENTE no .env local.")
+        key = getpass.getpass("OPENAI_API_KEY: ").strip()
+        if len(key) < 20:
+            print("Chave ausente/invalida. Encerrando sem enviar ordens.")
+            return 6
+        _set_env_file_value("OPENAI_API_KEY", key)
+        print("OPENAI_API_KEY salva localmente (valor nao exibido).")
+
+    return 0
+
+
+def _child_environment() -> dict[str, str]:
+    """Ensure every bot subprocess uses the OS-native TLS trust store."""
+    env = os.environ.copy()
+    bootstrap_path = str(TLS_BOOTSTRAP)
+    existing = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = bootstrap_path if not existing else bootstrap_path + os.pathsep + existing
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 
 
 def main() -> int:
@@ -41,8 +139,7 @@ def main() -> int:
         print("ERRO: Python 3.10+ e necessario.")
         return 2
 
-    env_file = ROOT / ".env"
-    if not env_file.exists():
+    if not ENV_FILE.exists():
         print("ERRO: .env local nao encontrado. As chaves nunca devem ser colocadas no GitHub.")
         return 3
 
@@ -62,10 +159,17 @@ def main() -> int:
     print("Instalando dependencias dentro da .venv ...", flush=True)
     run([str(py), "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")])
 
-    print("\nDependencias prontas. Iniciando fluxo live protegido ...", flush=True)
+    config_result = _configure_local_runtime()
+    if config_result != 0:
+        return config_result
+
+    child_env = _child_environment()
+    print("\nTLS: usando trust store nativo do sistema; verificacao de certificado permanece ATIVA.")
+    print("Dependencias/configuracao prontas. Iniciando fluxo live protegido ...", flush=True)
     return subprocess.call(
         [str(py), str(ROOT / "scripts" / "go_live_guarded.py")],
         cwd=str(ROOT),
+        env=child_env,
     )
 
 
