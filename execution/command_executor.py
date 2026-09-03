@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from dataclasses import asdict
+from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
 from approval import TradeApproval
-from command_protocol import Action, EntryType, Side, TradeCommand
+from command_protocol import Action, EntryType, TradeCommand
 from execution.exchange_adapter import ExchangeAdapter
 from execution.journal import ExecutionJournal
 from risk.governor import RiskGovernor
@@ -20,13 +25,68 @@ class CommandExecutor:
         adapter: Optional[ExchangeAdapter] = None,
         journal: Optional[ExecutionJournal] = None,
         position_manager: Any = None,
+        pending_path: str = "logs/pending_entries.json",
     ):
         self.connection = connection
         self.governor = governor or RiskGovernor(connection)
         self.adapter = adapter or ExchangeAdapter(connection)
         self.journal = journal or ExecutionJournal()
         self.position_manager = position_manager
+        self.pending_path = pending_path
         self.pending_entries: Dict[str, Dict[str, Any]] = {}
+        self._load_pending_entries()
+
+    @staticmethod
+    def _jsonable(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {str(k): CommandExecutor._jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [CommandExecutor._jsonable(v) for v in value]
+        return value
+
+    def _load_pending_entries(self) -> None:
+        if not os.path.exists(self.pending_path):
+            return
+        try:
+            with open(self.pending_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            restored: Dict[str, Dict[str, Any]] = {}
+            for client_id, item in (payload or {}).items():
+                command_payload = item.get("command") or {}
+                command = TradeCommand.from_dict(command_payload)
+                restored[str(client_id)] = {
+                    "command": command,
+                    "plan": dict(item.get("plan") or {}),
+                    "quantity": float(item.get("quantity") or 0),
+                    "symbol": str(item.get("symbol") or command.symbol or "").upper(),
+                }
+            self.pending_entries = restored
+        except Exception as exc:
+            self.pending_entries = {}
+            self.journal.append("PENDING_ENTRY_STATE_LOAD_FAILED", payload={"error": str(exc)}, level="ERROR")
+
+    def _save_pending_entries(self) -> None:
+        directory = os.path.dirname(self.pending_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload: Dict[str, Any] = {}
+        for client_id, item in self.pending_entries.items():
+            payload[client_id] = {
+                "command": self._jsonable(asdict(item["command"])),
+                "plan": self._jsonable(item.get("plan") or {}),
+                "quantity": float(item.get("quantity") or 0),
+                "symbol": str(item.get("symbol") or item["command"].symbol or "").upper(),
+            }
+        fd, temp_path = tempfile.mkstemp(prefix="pending_entries_", suffix=".json", dir=directory or None)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.pending_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def _approval_ok(self, command: TradeCommand, approval: Optional[TradeApproval]) -> Tuple[bool, str]:
         if command.action == Action.WAIT:
@@ -79,11 +139,73 @@ class CommandExecutor:
             return self.position_manager.modify_from_command(command, market_state)
         return {"status": "REJECTED", "reason": "UNSUPPORTED_ACTION", "command_id": command.command_id}
 
+    def _managed_for_command(self, command: TradeCommand) -> Optional[Dict[str, Any]]:
+        if self.position_manager is None:
+            return None
+        for state in self.position_manager.positions.values():
+            if state.get("command_id") == command.command_id:
+                return state
+        return None
+
     def _open(self, command: TradeCommand, plan: Dict[str, Any]) -> Dict[str, Any]:
         symbol = str(command.symbol).upper()
         position_side = command.side.value
         qty = float(plan["quantity"])
         leverage = int(plan["leverage"])
+        entry_client_id = self.adapter.client_order_id(command.command_id, "entry")
+
+        managed = self._managed_for_command(command)
+        if managed is not None:
+            return {
+                "status": "ALREADY_EXECUTED",
+                "reason": "POSITION_ALREADY_MANAGED_FOR_COMMAND",
+                "command_id": command.command_id,
+                "position": managed,
+            }
+
+        existing_pending = self.pending_entries.get(entry_client_id)
+        if existing_pending is not None:
+            return {
+                "status": "PENDING_FILL",
+                "reason": "ENTRY_ALREADY_PENDING",
+                "command_id": command.command_id,
+                "symbol": symbol,
+                "client_order_id": entry_client_id,
+            }
+
+        # Idempotency across process crashes: ask Binance whether our deterministic
+        # entry client ID already exists before creating a new order.
+        existing = self.adapter.query_order(symbol, client_order_id=entry_client_id)
+        if existing.get("success"):
+            order = existing.get("order") or {}
+            status = str(order.get("status") or "").upper()
+            if status == "FILLED":
+                filled_qty = self._filled_quantity(order, qty)
+                protection = self._install_protection(command, plan, filled_qty)
+                return {
+                    "status": "RECOVERED_EXECUTED" if protection.get("success") else protection.get("status", "FAILED_SAFE"),
+                    "command_id": command.command_id,
+                    "symbol": symbol,
+                    "quantity": filled_qty,
+                    "entry_order": order,
+                    "protection": protection,
+                }
+            if status in {"NEW", "PARTIALLY_FILLED"}:
+                self.pending_entries[entry_client_id] = {
+                    "command": command,
+                    "plan": plan,
+                    "quantity": qty,
+                    "symbol": symbol,
+                }
+                self._save_pending_entries()
+                return {
+                    "status": "PENDING_FILL",
+                    "reason": "ENTRY_RECOVERED_FROM_BINANCE",
+                    "command_id": command.command_id,
+                    "symbol": symbol,
+                    "client_order_id": entry_client_id,
+                    "order": order,
+                }
 
         self.journal.exchange_request(command.command_id, "SET_LEVERAGE", symbol=symbol, leverage=leverage)
         leverage_result = self.adapter.set_leverage(symbol, leverage)
@@ -114,7 +236,7 @@ class CommandExecutor:
             return {"status": "REJECTED", "reason": "ENTRY_ORDER_FAILED", "details": entry, "command_id": command.command_id}
 
         order = entry.get("order") or {}
-        client_order_id = order.get("clientOrderId") or self.adapter.client_order_id(command.command_id, "entry")
+        client_order_id = order.get("clientOrderId") or entry_client_id
         status = str(order.get("status") or "").upper()
 
         if command.entry_type == EntryType.LIMIT and status != "FILLED":
@@ -122,7 +244,9 @@ class CommandExecutor:
                 "command": command,
                 "plan": plan,
                 "quantity": float(entry.get("quantity") or qty),
+                "symbol": symbol,
             }
+            self._save_pending_entries()
             return {
                 "status": "PENDING_FILL",
                 "command_id": command.command_id,
@@ -148,7 +272,7 @@ class CommandExecutor:
 
     @staticmethod
     def _filled_quantity(order: Dict[str, Any], fallback: float) -> float:
-        for key in ("executedQty", "origQty"):
+        for key in ("executedQty", "origQty", "filled_qty"):
             try:
                 value = float(order.get(key) or 0)
             except (TypeError, ValueError):
@@ -160,6 +284,10 @@ class CommandExecutor:
     def _install_protection(self, command: TradeCommand, plan: Dict[str, Any], quantity: float) -> Dict[str, Any]:
         symbol = str(command.symbol).upper()
         position_side = command.side.value
+
+        managed = self._managed_for_command(command)
+        if managed is not None:
+            return {"success": True, "already_installed": True, "managed_position": managed}
 
         sl_price = float(plan.get("normalized_stop_loss") or command.stop_loss)
         self.journal.exchange_request(command.command_id, "SET_STOP_LOSS", symbol=symbol, stop_price=sl_price)
@@ -290,11 +418,13 @@ class CommandExecutor:
 
         if status in {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"}:
             self.pending_entries.pop(str(client_order_id), None)
+            self._save_pending_entries()
             return {"status": "ENTRY_TERMINATED", "command_id": command.command_id, "order_status": status}
         if status != "FILLED":
             return {"status": "ENTRY_PENDING", "command_id": command.command_id, "order_status": status}
 
         self.pending_entries.pop(str(client_order_id), None)
+        self._save_pending_entries()
         qty = float(order_event.get("filled_qty") or pending["quantity"])
         protection = self._install_protection(command, pending["plan"], qty)
         return {
@@ -303,3 +433,35 @@ class CommandExecutor:
             "quantity": qty,
             "protection": protection,
         }
+
+    def recover_pending_entries(self) -> Dict[str, Dict[str, Any]]:
+        """Reconcile persisted LIMIT entries with Binance after restart."""
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for client_id, pending in list(self.pending_entries.items()):
+            command: TradeCommand = pending["command"]
+            symbol = str(pending.get("symbol") or command.symbol or "").upper()
+            result = self.adapter.query_order(symbol, client_order_id=client_id)
+            if not result.get("success"):
+                outcomes[client_id] = {"status": "QUERY_FAILED", "details": result}
+                continue
+            order = result.get("order") or {}
+            status = str(order.get("status") or "").upper()
+            if status in {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}:
+                self.pending_entries.pop(client_id, None)
+                outcomes[client_id] = {"status": "TERMINATED", "order_status": status}
+                continue
+            if status == "FILLED":
+                qty = self._filled_quantity(order, float(pending.get("quantity") or 0))
+                protection = self._install_protection(command, pending["plan"], qty)
+                self.pending_entries.pop(client_id, None)
+                outcomes[client_id] = {
+                    "status": "RECOVERED_EXECUTED" if protection.get("success") else protection.get("status", "FAILED_SAFE"),
+                    "protection": protection,
+                    "quantity": qty,
+                }
+                continue
+            outcomes[client_id] = {"status": "PENDING_FILL", "order_status": status}
+        self._save_pending_entries()
+        if outcomes:
+            self.journal.append("PENDING_ENTRIES_RECOVERED", payload={"outcomes": outcomes})
+        return outcomes
