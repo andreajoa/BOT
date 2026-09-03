@@ -34,6 +34,7 @@ class FuturesUserDataStream:
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
         self._keepalive_task: Optional[asyncio.Task] = None
+        self.events: asyncio.Queue = asyncio.Queue(maxsize=4096)
 
         self.state: Dict[str, Any] = {
             "orders": {},
@@ -76,7 +77,7 @@ class FuturesUserDataStream:
                     refreshed = payload.get("listenKey")
                     if refreshed:
                         self.listen_key = str(refreshed)
-                except Exception as exc:  # reconnect loop will recreate when needed
+                except Exception as exc:
                     self.last_error = f"listenKey keepalive: {exc}"
                     return
 
@@ -135,31 +136,56 @@ class FuturesUserDataStream:
                     self._keepalive_task = None
                 await self._close_listen_key()
 
+    def _emit(self, event: Dict[str, Any]) -> None:
+        try:
+            self.events.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                self.events.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self.events.put_nowait(event)
+
+    async def next_event(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        if timeout is None:
+            return await self.events.get()
+        return await asyncio.wait_for(self.events.get(), timeout=timeout)
+
     async def _handle_message(self, raw: str) -> bool:
         payload = json.loads(raw)
         event_type = str(payload.get("e", ""))
         event_ms = int(payload.get("E") or payload.get("T") or time.time() * 1000)
+        normalized_event: Dict[str, Any] = {
+            "event_type": event_type,
+            "event_ms": event_ms,
+        }
 
         async with self._lock:
             self.state["last_event_type"] = event_type or None
             self.state["last_event_ms"] = event_ms
 
             if event_type == "ORDER_TRADE_UPDATE":
-                self._apply_order_update(payload, event_ms)
+                normalized_event["order"] = self._apply_order_update(payload, event_ms)
             elif event_type == "ACCOUNT_UPDATE":
-                self._apply_account_update(payload, event_ms)
+                normalized_event["account"] = self._apply_account_update(payload, event_ms)
             elif event_type == "MARGIN_CALL":
                 self.state["margin_call"] = deepcopy(payload)
+                normalized_event["margin_call"] = deepcopy(payload)
             elif event_type == "listenKeyExpired":
+                normalized_event["listen_key_expired"] = True
+                self._emit(normalized_event)
                 return True
+
+        if event_type:
+            self._emit(normalized_event)
         return False
 
-    def _apply_order_update(self, payload: Dict[str, Any], event_ms: int) -> None:
+    def _apply_order_update(self, payload: Dict[str, Any], event_ms: int) -> Dict[str, Any]:
         o = payload.get("o") or {}
         symbol = str(o.get("s", "")).upper()
         order_id = o.get("i")
         key = f"{symbol}:{order_id}"
-        self.state["orders"][key] = {
+        order = {
             "symbol": symbol,
             "order_id": order_id,
             "client_order_id": o.get("c"),
@@ -182,15 +208,19 @@ class FuturesUserDataStream:
             "event_ms": event_ms,
             "transaction_ms": int(payload.get("T") or event_ms),
         }
+        self.state["orders"][key] = order
+        return deepcopy(order)
 
-    def _apply_account_update(self, payload: Dict[str, Any], event_ms: int) -> None:
+    def _apply_account_update(self, payload: Dict[str, Any], event_ms: int) -> Dict[str, Any]:
         account = payload.get("a") or {}
         reason = account.get("m")
+        balances = []
+        positions = []
         for b in account.get("B") or []:
             asset = str(b.get("a", "")).upper()
             if not asset:
                 continue
-            self.state["balances"][asset] = {
+            item = {
                 "asset": asset,
                 "wallet_balance": self._float_or_none(b.get("wb")),
                 "cross_wallet_balance": self._float_or_none(b.get("cw")),
@@ -198,6 +228,8 @@ class FuturesUserDataStream:
                 "reason": reason,
                 "event_ms": event_ms,
             }
+            self.state["balances"][asset] = item
+            balances.append(deepcopy(item))
 
         for p in account.get("P") or []:
             symbol = str(p.get("s", "")).upper()
@@ -205,7 +237,7 @@ class FuturesUserDataStream:
             if not symbol:
                 continue
             key = f"{symbol}:{position_side}"
-            self.state["positions"][key] = {
+            item = {
                 "symbol": symbol,
                 "position_side": position_side,
                 "position_amount": self._float_or_none(p.get("pa")),
@@ -217,6 +249,10 @@ class FuturesUserDataStream:
                 "reason": reason,
                 "event_ms": event_ms,
             }
+            self.state["positions"][key] = item
+            positions.append(deepcopy(item))
+
+        return {"reason": reason, "balances": balances, "positions": positions}
 
     @staticmethod
     def _float_or_none(value: Any) -> Optional[float]:
@@ -237,6 +273,7 @@ class FuturesUserDataStream:
                 "last_message_ms": self.last_message_ms,
                 "reconnect_count": self.reconnect_count,
                 "last_error": self.last_error,
+                "event_queue_size": self.events.qsize(),
             }
         )
         return state
