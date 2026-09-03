@@ -7,14 +7,21 @@ from risk.governor import RiskGovernor
 
 
 class _FakeConn:
-    def __init__(self, balance=0.57):
+    def __init__(self, balance=0.57, min_qty=0.0):
         self.balance = balance
+        self.min_qty = float(min_qty)
 
     def get_usdt_balance(self):
         return self.balance
 
     def normalize_price(self, symbol, price, mode="nearest"):
         return float(price)
+
+    def normalize_quantity(self, symbol, quantity, market=True):
+        quantity = float(quantity)
+        if quantity < self.min_qty:
+            raise ValueError(f"Quantidade {quantity} abaixo do minimo {self.min_qty}")
+        return quantity
 
     def quantity_from_margin(self, symbol, margin_usdt, leverage, price):
         return {
@@ -72,6 +79,7 @@ class RiskGovernorTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertAlmostEqual(result.details["notional"], 5.0)
         self.assertGreater(result.details["max_loss_usdt"], result.details["estimated_loss_to_stop_usdt"])
+        self.assertEqual(result.details["take_profit_execution"][0]["mode"], "CLOSE_ALL")
 
     def test_small_balance_allows_only_one_active_position(self):
         gov = RiskGovernor(_FakeConn(balance=0.57), single_position_below_usdt=5.0)
@@ -105,6 +113,19 @@ class RiskGovernorTests(unittest.TestCase):
             result.details["estimated_loss_to_stop_usdt"],
             result.details["max_loss_usdt"],
         )
+
+    def test_rejects_partial_tp_below_exchange_minimum_quantity(self):
+        gov = RiskGovernor(_FakeConn(balance=0.57, min_qty=1.0))
+        command = _command(
+            take_profits=[
+                TakeProfitTarget(price=0.82, close_pct=10),
+                TakeProfitTarget(price=0.84, close_pct=90),
+            ]
+        )
+        result = gov.preflight(command, _state())
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "PARTIAL_TAKE_PROFIT_NOT_EXECUTABLE")
+        self.assertEqual(result.details["target_index"], 0)
 
 
 if __name__ == "__main__":
