@@ -11,7 +11,10 @@ websockets>=14.0
 # TLS nativo do macOS/Linux para urllib/websockets/http clients
 truststore>=0.10.4
 
-# Brain client
+# Private state/proposal bridge (Neon Postgres)
+psycopg[binary]>=3.2.0
+
+# Optional API brain mode. Not required when BRAIN_MODE=external_chatgpt.
 openai>=1.100.0
 
 # Analise de dados
