@@ -17,10 +17,9 @@ O antigo bot de Mean Reversion permanece apenas como legado/referência e não �
 - SL/TP/trailing são instalados e geridos pelo executor após confirmação de fill.
 - Uma entrada LIMIT só recebe proteção depois do fill real.
 - Entradas pendentes sobrevivem a restart e são reconciliadas por `newClientOrderId` determinístico.
+- IDs de entrada, SL, TP e trailing são deterministicamente diferentes mesmo quando o `command_id` real tem 32 caracteres.
 
 ## 1. Atualizar o código local
-
-Após a promoção final da branch para `main`:
 
 ```bash
 cd ~/Downloads/Organizados/Pessoal-Andre/coder/mercado_lateral || exit 1
@@ -148,7 +147,40 @@ A trilha deve permitir identificar:
 - PnL realizado;
 - fechamento/erro.
 
-## 8. Restart/recovery
+## 8. Auditoria final de 100% — somente leitura
+
+Depois do fill real e da instalação de SL/TP, rode em outro Terminal:
+
+```bash
+python3 scripts/final_acceptance.py --command-id <COMMAND_ID>
+```
+
+Esse comando não cria, altera, cancela nem fecha ordens. Ele apenas lê os arquivos locais e consulta a Binance para provar:
+
+- `main` local alinhada com `origin/main`;
+- runtime ativo e recente;
+- WebSocket público conectado;
+- User Data Stream conectado;
+- `decision_ready=true`;
+- aprovação específica do `command_id` registrada;
+- entrada realmente `FILLED` na Binance;
+- margem `ISOLATED`;
+- SL existente e, se a posição ainda estiver aberta, proteção de stop realmente ativa (inclusive trailing substituto);
+- TP(s) existentes e, se a posição ainda estiver aberta, pelo menos um TP ainda ativo;
+- lifecycle registrado pelo Position Manager/journal;
+- ausência de erro fatal ligado àquele comando.
+
+A validação só está concluída quando a saída trouxer:
+
+```json
+{
+  "hundred_percent": true,
+  "completion_percent": 100.0,
+  "orders_sent": 0
+}
+```
+
+## 9. Restart/recovery
 
 Se o processo cair:
 
@@ -156,9 +188,9 @@ Se o processo cair:
 python3 main.py
 ```
 
-O runtime recarrega posições geridas e entradas LIMIT pendentes. O executor consulta a Binance usando o `newClientOrderId` determinístico antes de reenviar qualquer entrada, reduzindo risco de duplicidade.
+O runtime recarrega posições geridas e entradas LIMIT pendentes. O executor consulta a Binance usando `newClientOrderId` determinístico antes de reenviar entrada ou proteção, reduzindo risco de duplicidade.
 
-## 9. Kill switch manual
+## 10. Kill switch manual
 
 Para interromper o runtime:
 
@@ -181,13 +213,11 @@ Todos ficam ignorados pelo Git:
 
 ## Regra para a primeira operação real
 
-Antes da primeira entrada:
-
-1. CI final verde e código promovido para `main`.
+1. CI final verde na `main`.
 2. `live_preflight.py --brain` com `ok=true` e `orders_sent=0`.
 3. Runtime com `market_stream_connected=true` e `user_stream_connected=true`.
 4. `decision_ready=true`.
 5. Proposta concreta passando o hard limit de perda até o stop.
 6. Proposta revisada e aprovada pelo `command_id` exato.
-7. Confirmar que a entrada está em `ISOLATED`.
-8. Confirmar fill + SL + TP no journal/estado da Binance.
+7. Confirmar fill + `ISOLATED` + SL + TP.
+8. Rodar `final_acceptance.py --command-id <COMMAND_ID>` e exigir `hundred_percent=true`.
