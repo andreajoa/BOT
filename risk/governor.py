@@ -25,6 +25,8 @@ class RiskGovernor:
         max_margin_usage_pct: Optional[float] = None,
         single_position_below_usdt: Optional[float] = None,
         max_open_positions: Optional[int] = None,
+        max_loss_pct_balance: Optional[float] = None,
+        estimated_taker_fee_rate: Optional[float] = None,
     ):
         self.connection = connection
         self.max_leverage = int(max_leverage or os.getenv("MAX_LEVERAGE_HARD", "20"))
@@ -33,6 +35,14 @@ class RiskGovernor:
             single_position_below_usdt or os.getenv("SINGLE_POSITION_BELOW_USDT", "5.0")
         )
         self.max_open_positions = int(max_open_positions or os.getenv("MAX_OPEN_POSITIONS_HARD", "3"))
+        self.max_loss_pct_balance = float(
+            max_loss_pct_balance if max_loss_pct_balance is not None
+            else os.getenv("MAX_LOSS_PCT_BALANCE_HARD", "0.35")
+        )
+        self.estimated_taker_fee_rate = float(
+            estimated_taker_fee_rate if estimated_taker_fee_rate is not None
+            else os.getenv("ESTIMATED_TAKER_FEE_RATE", "0.0005")
+        )
 
     @staticmethod
     def _active_positions(market_state: Dict[str, Any]) -> list:
@@ -156,6 +166,28 @@ class RiskGovernor:
         if not sizing.get("success"):
             return PreflightResult(False, str(sizing.get("error") or "SIZING_REJECTED"), dict(sizing))
 
+        notional = float(sizing["notional"])
+        stop_distance_pct = abs(float(normalized_stop) - float(reference)) / float(reference)
+        price_risk_usdt = notional * stop_distance_pct
+        estimated_roundtrip_fees_usdt = notional * self.estimated_taker_fee_rate * 2.0
+        estimated_loss_to_stop_usdt = price_risk_usdt + estimated_roundtrip_fees_usdt
+        max_loss_usdt = available * self.max_loss_pct_balance
+        if estimated_loss_to_stop_usdt > max_loss_usdt:
+            return PreflightResult(
+                False,
+                "ESTIMATED_STOP_LOSS_EXCEEDS_HARD_LIMIT",
+                {
+                    "estimated_loss_to_stop_usdt": estimated_loss_to_stop_usdt,
+                    "price_risk_usdt": price_risk_usdt,
+                    "estimated_roundtrip_fees_usdt": estimated_roundtrip_fees_usdt,
+                    "max_loss_usdt": max_loss_usdt,
+                    "max_loss_pct_balance": self.max_loss_pct_balance,
+                    "stop_distance_pct": stop_distance_pct,
+                    "notional": notional,
+                    "available_usdt": available,
+                },
+            )
+
         return PreflightResult(
             True,
             "OK",
@@ -164,12 +196,15 @@ class RiskGovernor:
                 "side": command.side.value,
                 "reference_price": reference,
                 "quantity": sizing["quantity"],
-                "notional": sizing["notional"],
+                "notional": notional,
                 "actual_margin": sizing["actual_margin"],
                 "leverage": leverage,
                 "normalized_entry_price": normalized_entry,
                 "normalized_stop_loss": normalized_stop,
                 "normalized_take_profits": normalized_tps,
                 "available_usdt": available,
+                "stop_distance_pct": stop_distance_pct,
+                "estimated_loss_to_stop_usdt": estimated_loss_to_stop_usdt,
+                "max_loss_usdt": max_loss_usdt,
             },
         )
