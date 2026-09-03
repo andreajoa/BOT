@@ -3,14 +3,17 @@
 # Binance API / REST
 python-binance>=1.0.19
 
-# WebSocket publico Binance USD-M
+# WebSocket publico/privado Binance USD-M
 websockets>=14.0
+
+# Brain client
+openai>=1.100.0
 
 # Analise de dados
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Indicadores tecnicos legados (serao mantidos como ferramentas opcionais)
+# Indicadores tecnicos legados (mantidos como ferramentas opcionais)
 ta>=0.11.0
 
 # Configuracoes
