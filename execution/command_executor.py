@@ -26,6 +26,7 @@ class CommandExecutor:
         journal: Optional[ExecutionJournal] = None,
         position_manager: Any = None,
         pending_path: str = "logs/pending_entries.json",
+        recover_on_init: bool = True,
     ):
         self.connection = connection
         self.governor = governor or RiskGovernor(connection)
@@ -34,7 +35,10 @@ class CommandExecutor:
         self.position_manager = position_manager
         self.pending_path = pending_path
         self.pending_entries: Dict[str, Dict[str, Any]] = {}
+        self.recovery_outcomes: Dict[str, Dict[str, Any]] = {}
         self._load_pending_entries()
+        if recover_on_init and self.pending_entries:
+            self.recovery_outcomes = self.recover_pending_entries()
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
@@ -173,8 +177,6 @@ class CommandExecutor:
                 "client_order_id": entry_client_id,
             }
 
-        # Idempotency across process crashes: ask Binance whether our deterministic
-        # entry client ID already exists before creating a new order.
         existing = self.adapter.query_order(symbol, client_order_id=entry_client_id)
         if existing.get("success"):
             order = existing.get("order") or {}
@@ -404,7 +406,6 @@ class CommandExecutor:
         return "LONG" if float(position.get("position_amount") or 0) > 0 else "SHORT"
 
     def handle_order_event(self, order_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Called from User Data Stream. Finalizes protections only after LIMIT fill."""
         client_order_id = order_event.get("client_order_id")
         if not client_order_id:
             return None
@@ -435,7 +436,6 @@ class CommandExecutor:
         }
 
     def recover_pending_entries(self) -> Dict[str, Dict[str, Any]]:
-        """Reconcile persisted LIMIT entries with Binance after restart."""
         outcomes: Dict[str, Dict[str, Any]] = {}
         for client_id, pending in list(self.pending_entries.items()):
             command: TradeCommand = pending["command"]
