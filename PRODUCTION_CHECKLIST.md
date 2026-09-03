@@ -27,15 +27,18 @@
 - [x] Persistent approvals/pending command state
 - [x] Persistent pending LIMIT entry state
 - [x] Deterministic newClientOrderId idempotency
+- [x] Client IDs preserve explicit order role even with real 32-character command IDs
 - [x] Restart reconciliation for pending LIMIT entries
+- [x] Idempotent SL/TP protection recovery after crash/restart
 - [x] Dynamic candidate universe with mandatory monitoring of open positions
 - [x] Runtime status file
 - [x] Unit-test CI
 - [x] Non-trading live preflight
+- [x] Read-only final live acceptance audit
 - [x] Operations runbook
 
 ## Must be verified on the local runtime before first live entry
-- [ ] Pull latest `main` after final promotion
+- [ ] Pull latest `main` after final CI
 - [ ] Install latest requirements
 - [ ] `.env` contains Binance credentials, OpenAI key and `BOT_MODE=live`
 - [ ] `python3 scripts/live_preflight.py --brain` returns `ok=true`
@@ -52,9 +55,10 @@
 - [ ] SL is visible/confirmed
 - [ ] TP is visible/confirmed
 - [ ] Journal records entry + protection
-- [ ] Position Manager reconciles the real open position
+- [ ] Position Manager records/reconciles the lifecycle
+- [ ] `python3 scripts/final_acceptance.py --command-id <COMMAND_ID>` returns `hundred_percent=true`
 
 ## Completion definition
 
-Repository implementation is complete only after the final CI is green and the tested branch is promoted to `main`.
-End-to-end live validation reaches 100% only after the local runtime passes every unchecked item above using the real account, because credentials are intentionally not available to GitHub CI.
+Repository implementation is complete only after the final CI is green on `main`.
+End-to-end live validation reaches 100% only when `scripts/final_acceptance.py` returns `hundred_percent=true` for the exact approved real command. The final audit is read-only and never calls create/change/cancel/close order endpoints.
