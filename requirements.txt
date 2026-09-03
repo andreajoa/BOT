@@ -8,6 +8,9 @@ python-binance>=1.0.37
 # WebSocket publico/privado Binance USD-M
 websockets>=14.0
 
+# TLS nativo do macOS/Linux para urllib/websockets/http clients
+truststore>=0.10.4
+
 # Brain client
 openai>=1.100.0
 
