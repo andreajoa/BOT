@@ -19,16 +19,21 @@
 - [x] Strategy-agnostic Risk Governor
 - [x] Hard estimated loss-to-stop cap including estimated round-trip fees
 - [x] MARKET/LIMIT execution separation
+- [x] Pending entry intent persisted before network submission
+- [x] Ambiguous submission/query outcome never blindly resends an entry
+- [x] Deterministic entry recovery by clientOrderId after timeout/crash
+- [x] PARTIALLY_FILLED entry cancels remainder and protects executed quantity immediately
+- [x] Unfilled LIMIT is canceled after command TTL expires
 - [x] Real fill required before LIMIT protection
 - [x] SL / TP / partial TP
 - [x] Persistent trailing Position Manager
 - [x] Fail-safe emergency flatten if critical protection install fails
 - [x] Execution journal
 - [x] Persistent approvals/pending command state
-- [x] Persistent pending LIMIT entry state
+- [x] Persistent pending entry state
 - [x] Deterministic newClientOrderId idempotency
 - [x] Client IDs preserve explicit order role even with real 32-character command IDs
-- [x] Restart reconciliation for pending LIMIT entries
+- [x] Restart reconciliation for pending entries
 - [x] Idempotent SL/TP protection recovery after crash/restart
 - [x] Dynamic candidate universe with mandatory monitoring of open positions
 - [x] Runtime status file
