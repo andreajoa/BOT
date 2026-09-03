@@ -18,7 +18,7 @@ import signal
 import time
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from account.user_stream import FuturesUserDataStream
 from command_protocol import Action
@@ -61,8 +61,11 @@ class AdaptiveRuntime:
         self.decision_interval = max(5, int(os.getenv("BRAIN_DECISION_INTERVAL_SECONDS", "20")))
         self.command_ttl = max(15, int(os.getenv("BRAIN_COMMAND_TTL_SECONDS", "90")))
         self.status_interval = max(1, int(os.getenv("STATUS_INTERVAL_SECONDS", "2")))
+        self.universe_refresh_interval = max(30, int(os.getenv("UNIVERSE_REFRESH_SECONDS", "300")))
 
         self.symbols: List[str] = []
+        self.candidate_symbols: List[str] = []
+        self.scanner: Optional[ExecutableSymbolScanner] = None
         self.market_stream: Optional[FuturesMarketStream] = None
         self.derivatives: Optional[DerivativesSampler] = None
         self.structure: Optional[StructureSampler] = None
@@ -82,19 +85,32 @@ class AdaptiveRuntime:
         if not connected:
             raise RuntimeError("Falha ao conectar na Binance Futures")
 
-        scanner = ExecutableSymbolScanner(
+        self.scanner = ExecutableSymbolScanner(
             self.connection,
             max_leverage=self.max_leverage,
             max_margin_usage_pct=self.max_margin_usage_pct,
         )
-        universe = await asyncio.to_thread(scanner.scan, None, self.max_symbols)
-        self.symbols = [row["symbol"] for row in universe]
+        universe = await asyncio.to_thread(self.scanner.scan, None, self.max_symbols)
+        self.candidate_symbols = [row["symbol"] for row in universe]
+
+        raw_positions = await asyncio.to_thread(self.connection.client.futures_position_information)
+        open_symbols = {
+            str(p.get("symbol", "")).upper()
+            for p in raw_positions
+            if abs(float(p.get("positionAmt") or 0)) > 0
+        }
+        self.symbols = sorted(set(self.candidate_symbols) | open_symbols)
         if not self.symbols:
-            raise RuntimeError("Nenhum contrato USD-M executavel com o saldo/politica atuais")
+            raise RuntimeError("Nenhum contrato USD-M executavel e nenhuma posicao aberta para monitorar")
 
         self.journal.append(
             "RUNTIME_UNIVERSE",
-            payload={"symbols": self.symbols, "scanner": universe},
+            payload={
+                "symbols": self.symbols,
+                "candidate_symbols": self.candidate_symbols,
+                "required_open_symbols": sorted(open_symbols),
+                "scanner": universe,
+            },
         )
 
         self.market_stream = FuturesMarketStream(self.symbols)
@@ -123,21 +139,23 @@ class AdaptiveRuntime:
             position_manager=self.position_manager,
         )
 
-        # Seed private account state immediately; the websocket then maintains it.
-        await self._bootstrap_account_state()
-        # Initial slow public features before first decision.
+        await self._bootstrap_account_state(raw_positions=raw_positions)
         await asyncio.gather(
             self.derivatives.sample_once(),
             self.structure.sample_once(),
             return_exceptions=True,
         )
 
-    async def _bootstrap_account_state(self) -> None:
+    async def _bootstrap_account_state(self, raw_positions: Optional[List[Dict[str, Any]]] = None) -> None:
         assert self.user_stream is not None
-        balances, positions = await asyncio.gather(
-            asyncio.to_thread(self.connection.client.futures_account_balance),
-            asyncio.to_thread(self.connection.client.futures_position_information),
-        )
+        balance_task = asyncio.to_thread(self.connection.client.futures_account_balance)
+        if raw_positions is None:
+            positions_task = asyncio.to_thread(self.connection.client.futures_position_information)
+            balances, positions = await asyncio.gather(balance_task, positions_task)
+        else:
+            balances = await balance_task
+            positions = raw_positions
+
         now_ms = int(time.time() * 1000)
         async with self.user_stream._lock:
             for b in balances:
@@ -176,6 +194,73 @@ class AdaptiveRuntime:
             self.user_stream.state["last_event_type"] = "REST_BOOTSTRAP"
             self.user_stream.state["last_event_ms"] = now_ms
 
+    def _required_monitor_symbols(self) -> Set[str]:
+        required: Set[str] = set()
+        if self.position_manager:
+            required.update(
+                str(state.get("symbol", "")).upper()
+                for state in self.position_manager.positions.values()
+                if state.get("symbol")
+            )
+        if self.user_stream:
+            for position in (self.user_stream.state.get("positions") or {}).values():
+                if abs(float(position.get("position_amount") or 0)) > 0:
+                    required.add(str(position.get("symbol", "")).upper())
+        if self.executor:
+            for pending in self.executor.pending_entries.values():
+                command = pending.get("command")
+                if command and command.symbol:
+                    required.add(str(command.symbol).upper())
+        pending = self.gateway.pending()
+        if pending and pending[0].symbol:
+            required.add(str(pending[0].symbol).upper())
+        return {symbol for symbol in required if symbol}
+
+    async def refresh_universe_once(self) -> Dict[str, Any]:
+        assert self.scanner and self.market_stream and self.derivatives and self.structure
+        universe = await asyncio.to_thread(self.scanner.scan, None, self.max_symbols)
+        candidates = [row["symbol"] for row in universe]
+        required = self._required_monitor_symbols()
+        new_symbols = sorted(set(candidates) | required)
+        if not new_symbols:
+            new_symbols = list(self.symbols)
+
+        changed = new_symbols != sorted(self.symbols) or candidates != self.candidate_symbols
+        self.candidate_symbols = candidates
+        if changed:
+            await asyncio.gather(
+                self.market_stream.replace_symbols(new_symbols),
+                self.derivatives.replace_symbols(new_symbols),
+                self.structure.replace_symbols(new_symbols),
+            )
+            self.symbols = new_symbols
+            await asyncio.gather(
+                self.derivatives.sample_once(),
+                self.structure.sample_once(),
+                return_exceptions=True,
+            )
+            self.journal.append(
+                "RUNTIME_UNIVERSE_UPDATED",
+                payload={
+                    "symbols": self.symbols,
+                    "candidate_symbols": self.candidate_symbols,
+                    "required_symbols": sorted(required),
+                    "scanner": universe,
+                },
+            )
+        return {"changed": changed, "symbols": self.symbols, "candidate_symbols": self.candidate_symbols}
+
+    async def universe_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.refresh_universe_once()
+            except Exception as exc:
+                self.journal.append("UNIVERSE_REFRESH_ERROR", payload={"error": str(exc)}, level="ERROR")
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=self.universe_refresh_interval)
+            except asyncio.TimeoutError:
+                continue
+
     async def build_state(self) -> Dict[str, Any]:
         assert self.market_stream and self.derivatives and self.structure and self.user_stream
         market_snapshot, derivatives_snapshot, structure_snapshot, account_snapshot = await asyncio.gather(
@@ -187,15 +272,15 @@ class AdaptiveRuntime:
         market_context = MarketContextBuilder.build(
             market_snapshot,
             symbols=self.symbols,
-            max_symbols=self.max_symbols,
+            max_symbols=len(self.symbols),
             derivatives_snapshot=derivatives_snapshot,
             structure_snapshot=structure_snapshot,
         )
         state = self.state_assembler.build(market_context, account_snapshot)
-        # Available balance is relevant to the model, but secret credentials never are.
         usdt = (account_snapshot.get("balances") or {}).get("USDT") or {}
         state["account"]["available_balance_usdt"] = usdt.get("available_balance")
-        state["candidate_symbols"] = list(self.symbols)
+        state["candidate_symbols"] = list(self.candidate_symbols)
+        state["monitor_only_symbols"] = sorted(set(self.symbols) - set(self.candidate_symbols))
         self.latest_state = state
         return state
 
@@ -253,32 +338,38 @@ class AdaptiveRuntime:
         assert self.brain and self.governor and self.executor
         while not self.stop_event.is_set():
             try:
-                # Do not generate another proposal while one is waiting for approval
-                # or while a LIMIT entry is waiting for a real fill.
                 pending = self.gateway.pending()
                 if pending is None and not self.executor.pending_entries:
                     state = await self.build_state()
                     command = await asyncio.to_thread(self.brain.decide, state)
                     self.journal.command_received(command)
                     if command.action != Action.WAIT:
-                        preflight = await asyncio.to_thread(self.governor.preflight, command, state)
-                        self.journal.validation(command.command_id, preflight.accepted, preflight.reason, details=preflight.details)
-                        if preflight.accepted:
-                            self.gateway.publish(
-                                command,
-                                {
-                                    "accepted": True,
-                                    "reason": preflight.reason,
-                                    "details": preflight.details,
-                                },
-                            )
-                        else:
+                        if command.action == Action.OPEN_POSITION and command.symbol not in self.candidate_symbols:
                             self.journal.append(
                                 "BRAIN_COMMAND_REJECTED_LOCALLY",
                                 command.command_id,
-                                {"reason": preflight.reason, "details": preflight.details},
+                                {"reason": "SYMBOL_NOT_EXECUTABLE_CANDIDATE", "symbol": command.symbol},
                                 "WARN",
                             )
+                        else:
+                            preflight = await asyncio.to_thread(self.governor.preflight, command, state)
+                            self.journal.validation(command.command_id, preflight.accepted, preflight.reason, details=preflight.details)
+                            if preflight.accepted:
+                                self.gateway.publish(
+                                    command,
+                                    {
+                                        "accepted": True,
+                                        "reason": preflight.reason,
+                                        "details": preflight.details,
+                                    },
+                                )
+                            else:
+                                self.journal.append(
+                                    "BRAIN_COMMAND_REJECTED_LOCALLY",
+                                    command.command_id,
+                                    {"reason": preflight.reason, "details": preflight.details},
+                                    "WARN",
+                                )
                     else:
                         self.journal.append("BRAIN_WAIT", command.command_id, {"reason": command.reason})
             except Exception as exc:
@@ -322,6 +413,8 @@ class AdaptiveRuntime:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "bot_mode": BOT_MODE,
                     "symbols": self.symbols,
+                    "candidate_symbols": self.candidate_symbols,
+                    "monitor_only_symbols": sorted(set(self.symbols) - set(self.candidate_symbols)),
                     "market_stream_connected": bool(self.market_stream and self.market_stream.connected),
                     "user_stream_connected": bool(self.user_stream and self.user_stream.connected),
                     "decision_ready": self.latest_state.get("decision_ready"),
@@ -348,9 +441,10 @@ class AdaptiveRuntime:
             asyncio.create_task(self.market_price_loop(), name="position-prices"),
             asyncio.create_task(self.decision_loop(), name="brain-decisions"),
             asyncio.create_task(self.approval_loop(), name="approvals"),
+            asyncio.create_task(self.universe_loop(), name="universe-refresh"),
             asyncio.create_task(self.status_loop(), name="status"),
         ]
-        self.journal.append("RUNTIME_STARTED", payload={"symbols": self.symbols})
+        self.journal.append("RUNTIME_STARTED", payload={"symbols": self.symbols, "candidate_symbols": self.candidate_symbols})
         try:
             await self.stop_event.wait()
         finally:
