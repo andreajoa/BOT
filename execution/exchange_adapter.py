@@ -39,8 +39,47 @@ class ExchangeAdapter:
     def _close_side(position_side: str) -> str:
         return "SELL" if position_side == "LONG" else "BUY"
 
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
+        normalized = str(margin_type).upper()
+        if normalized not in {"ISOLATED", "CROSSED"}:
+            return {"success": False, "error": f"margin_type invalido: {margin_type}"}
+        try:
+            result = self.client.futures_change_margin_type(
+                symbol=symbol.upper(),
+                marginType=normalized,
+            )
+            return {"success": True, "margin_type": normalized, "result": result}
+        except BinanceAPIException as exc:
+            message = str(getattr(exc, "message", "") or "")
+            # Binance code -4046 means the symbol already has the requested type.
+            if getattr(exc, "code", None) == -4046 or "No need to change margin type" in message:
+                return {
+                    "success": True,
+                    "margin_type": normalized,
+                    "already_set": True,
+                    "result": {"code": getattr(exc, "code", None), "message": message},
+                }
+            return {"success": False, "error": f"{exc.code}: {exc.message}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        return self.connection.set_leverage(symbol, leverage)
+        # Force isolated margin before leverage/entry so the planned margin is not
+        # silently exposed to unrelated account equity through CROSS mode.
+        margin = self.set_margin_type(symbol, "ISOLATED")
+        if not margin.get("success"):
+            return {
+                "success": False,
+                "error": "SET_ISOLATED_MARGIN_FAILED",
+                "margin_result": margin,
+            }
+        leverage_result = self.connection.set_leverage(symbol, leverage)
+        if not leverage_result.get("success"):
+            return leverage_result
+        leverage_result = dict(leverage_result)
+        leverage_result["margin_type"] = "ISOLATED"
+        leverage_result["margin_result"] = margin
+        return leverage_result
 
     def open_market(self, command_id: str, symbol: str, position_side: str, quantity: float) -> Dict[str, Any]:
         try:
