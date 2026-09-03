@@ -88,15 +88,36 @@ class DerivativesSampler:
             "ratio_period": self.period,
         }
 
+    @staticmethod
+    def _add_oi_change(current: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        item = dict(current)
+        current_oi = item.get("open_interest")
+        previous_oi = (previous or {}).get("open_interest")
+        change = None
+        absolute_change = None
+        if current_oi is not None and previous_oi is not None and float(previous_oi) != 0:
+            current_value = float(current_oi)
+            previous_value = float(previous_oi)
+            absolute_change = current_value - previous_value
+            change = (absolute_change / previous_value) * 100.0
+        item["previous_open_interest"] = previous_oi
+        item["open_interest_change"] = absolute_change
+        item["open_interest_change_pct"] = change
+        return item
+
     async def sample_once(self) -> Dict[str, Dict[str, Any]]:
         results = await asyncio.gather(*(self.sample_symbol(s) for s in self.symbols), return_exceptions=True)
         update: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
+        async with self._lock:
+            previous_state = deepcopy(self.state)
+
         for symbol, result in zip(self.symbols, results):
             if isinstance(result, Exception):
                 errors.append(f"{symbol}: {result}")
             else:
-                update[symbol] = result
+                update[symbol] = self._add_oi_change(result, previous_state.get(symbol))
+
         async with self._lock:
             self.state.update(update)
             self.last_update_ms = int(time.time() * 1000)
