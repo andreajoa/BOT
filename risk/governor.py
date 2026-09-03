@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from command_protocol import Action, EntryType, Side, TradeCommand
@@ -84,17 +84,23 @@ class RiskGovernor:
         if command.action == Action.WAIT:
             return PreflightResult(True, "WAIT", {})
 
+        symbol = str(command.symbol).upper()
+
+        # Saidas devem permanecer disponiveis mesmo se o stream publico estiver
+        # degradado. O executor confirma a posicao real antes de enviar a ordem.
+        if command.action == Action.CLOSE_POSITION:
+            return PreflightResult(True, "OK", {"symbol": symbol, "exit_without_public_market_dependency": True})
+
         if not market_state.get("decision_ready"):
             return PreflightResult(False, "MARKET_STATE_NOT_READY", {"flags": market_state.get("quality_flags") or []})
 
-        symbol = str(command.symbol).upper()
         row = self._symbol_row(market_state, symbol)
         if row is None:
             return PreflightResult(False, "SYMBOL_NOT_IN_CURRENT_STATE", {"symbol": symbol})
         if row.get("data_quality") != "OK":
             return PreflightResult(False, "SYMBOL_DATA_DEGRADED", {"flags": row.get("quality_flags") or []})
 
-        if command.action != Action.OPEN_POSITION:
+        if command.action == Action.MODIFY_POSITION:
             return PreflightResult(True, "OK", {"symbol": symbol})
 
         available = self.connection.get_usdt_balance()
