@@ -71,6 +71,7 @@ class RiskGovernorTests(unittest.TestCase):
         result = gov.preflight(_command(), _state())
         self.assertTrue(result.accepted)
         self.assertAlmostEqual(result.details["notional"], 5.0)
+        self.assertGreater(result.details["max_loss_usdt"], result.details["estimated_loss_to_stop_usdt"])
 
     def test_small_balance_allows_only_one_active_position(self):
         gov = RiskGovernor(_FakeConn(balance=0.57), single_position_below_usdt=5.0)
@@ -90,6 +91,20 @@ class RiskGovernorTests(unittest.TestCase):
         result = gov.preflight(_command(leverage=50), _state())
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "LEVERAGE_OUT_OF_BOUNDS")
+
+    def test_rejects_trade_whose_stop_risk_exceeds_balance_cap(self):
+        gov = RiskGovernor(
+            _FakeConn(balance=0.57),
+            max_loss_pct_balance=0.35,
+            estimated_taker_fee_rate=0.0005,
+        )
+        result = gov.preflight(_command(stop_loss=0.70), _state())
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "ESTIMATED_STOP_LOSS_EXCEEDS_HARD_LIMIT")
+        self.assertGreater(
+            result.details["estimated_loss_to_stop_usdt"],
+            result.details["max_loss_usdt"],
+        )
 
 
 if __name__ == "__main__":
