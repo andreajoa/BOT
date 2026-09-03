@@ -85,6 +85,69 @@ class RiskGovernor:
                 return False, "SHORT_TP_MUST_BE_BELOW_ENTRY"
         return True, "OK"
 
+    def _validate_partial_take_profits(
+        self,
+        symbol: str,
+        total_quantity: float,
+        command: TradeCommand,
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Ensure every quantity-based TP can satisfy exchange lot filters.
+
+        The final target may use closePosition=true only when cumulative close_pct
+        reaches 100%. Earlier targets (or a final target below 100%) require an
+        explicit quantity and therefore must normalize to a valid market quantity.
+        """
+        cumulative_pct = 0.0
+        normalized_targets = []
+        targets = list(command.take_profits)
+        for index, target in enumerate(targets):
+            pct = float(target.close_pct)
+            cumulative_pct += pct
+            is_last = index == len(targets) - 1
+            uses_close_all = is_last and cumulative_pct >= 99.999
+            if uses_close_all:
+                normalized_targets.append(
+                    {
+                        "index": index,
+                        "close_pct": pct,
+                        "mode": "CLOSE_ALL",
+                        "quantity": None,
+                    }
+                )
+                continue
+
+            requested_qty = float(total_quantity) * (pct / 100.0)
+            try:
+                normalized_qty = self.connection.normalize_quantity(
+                    symbol,
+                    requested_qty,
+                    market=True,
+                )
+            except Exception as exc:
+                return False, {
+                    "target_index": index,
+                    "close_pct": pct,
+                    "requested_quantity": requested_qty,
+                    "error": str(exc),
+                }
+            if normalized_qty <= 0 or normalized_qty > float(total_quantity):
+                return False, {
+                    "target_index": index,
+                    "close_pct": pct,
+                    "requested_quantity": requested_qty,
+                    "normalized_quantity": normalized_qty,
+                    "error": "PARTIAL_TP_QUANTITY_INVALID",
+                }
+            normalized_targets.append(
+                {
+                    "index": index,
+                    "close_pct": pct,
+                    "mode": "PARTIAL",
+                    "quantity": normalized_qty,
+                }
+            )
+        return True, {"targets": normalized_targets}
+
     def preflight(self, command: TradeCommand, market_state: Dict[str, Any]) -> PreflightResult:
         try:
             command.validate()
@@ -166,6 +229,18 @@ class RiskGovernor:
         if not sizing.get("success"):
             return PreflightResult(False, str(sizing.get("error") or "SIZING_REJECTED"), dict(sizing))
 
+        tp_ok, tp_details = self._validate_partial_take_profits(
+            symbol,
+            float(sizing["quantity"]),
+            command,
+        )
+        if not tp_ok:
+            return PreflightResult(
+                False,
+                "PARTIAL_TAKE_PROFIT_NOT_EXECUTABLE",
+                tp_details,
+            )
+
         notional = float(sizing["notional"])
         stop_distance_pct = abs(float(normalized_stop) - float(reference)) / float(reference)
         price_risk_usdt = notional * stop_distance_pct
@@ -202,6 +277,7 @@ class RiskGovernor:
                 "normalized_entry_price": normalized_entry,
                 "normalized_stop_loss": normalized_stop,
                 "normalized_take_profits": normalized_tps,
+                "take_profit_execution": tp_details["targets"],
                 "available_usdt": available,
                 "stop_distance_pct": stop_distance_pct,
                 "estimated_loss_to_stop_usdt": estimated_loss_to_stop_usdt,
